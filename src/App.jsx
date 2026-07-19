@@ -1328,7 +1328,6 @@ function ProjectDetail({ project, state, actions, currentUser, onClose, onEdit }
           {p.client && <div style={{ fontSize: 13.5, color: C.blue, marginTop: 4, fontWeight: 600 }}>{p.client}</div>}
         </div>
         {onEdit && <GhostButton onClick={onEdit}><Pencil size={14} /> Edit</GhostButton>}
-        <IconBtn onClick={onClose}><X size={16} /></IconBtn>
       </div>
       {p.description && <p style={{ fontSize: 13, color: C.ink2, lineHeight: 1.55, margin: "10px 0 16px" }}>{p.description}</p>}
       <div style={{ display: "flex", gap: 20, flexWrap: "wrap", fontSize: 12.5, marginBottom: 18, color: C.ink2 }}>
@@ -1416,15 +1415,17 @@ function TaskItem({ item, members, assignOptions, onToggle, onSave, onDelete }) 
     </div>
   );
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9, flexWrap: "wrap" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", background: C.panel, border: `1px solid ${C.line}`, borderRadius: 9 }}>
       <Checkbox on={item.done} onClick={onToggle} />
-      <span style={{ flex: "1 1 120px", fontSize: 13, textDecoration: item.done ? "line-through" : "none", color: item.done ? C.muted : C.ink }}>{item.text}</span>
-      {di && <span style={{ fontSize: 11, fontWeight: 700, color: di.color, whiteSpace: "nowrap" }}>{di.label}</span>}
-      {item.dueDate && <span className="mono" style={{ fontSize: 11, color: C.muted }}>{item.dueDate}</span>}
-      <TaskStatusPill status={item.status} />
-      <AssigneeChip assignee={item.assignee} members={members} />
-      <IconBtn onClick={() => setEdit(true)} small><Pencil size={13} /></IconBtn>
-      <IconBtn onClick={onDelete} danger small><Trash2 size={13} /></IconBtn>
+      <span style={{ flex: 1, minWidth: 0, fontSize: 13, textDecoration: item.done ? "line-through" : "none", color: item.done ? C.muted : C.ink }}>{item.text}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+        {di && <span style={{ fontSize: 11, fontWeight: 700, color: di.color, whiteSpace: "nowrap" }}>{di.label}</span>}
+        {item.dueDate && <span className="mono" style={{ fontSize: 11, color: C.muted }}>{item.dueDate}</span>}
+        <TaskStatusPill status={item.status} />
+        <AssigneeChip assignee={item.assignee} members={members} />
+        <IconBtn onClick={() => setEdit(true)} small><Pencil size={13} /></IconBtn>
+        <IconBtn onClick={onDelete} danger small><Trash2 size={13} /></IconBtn>
+      </div>
     </div>
   );
 }
@@ -1625,10 +1626,13 @@ function ToDo({ state, actions, currentUser }) {
                   </div>
                   <div style={{ display: "grid", gap: 6 }}>
                     {open.map((i) => { const di = dueInfo(i); return (
-                      <div key={i.id} style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", background: C.bg, borderRadius: 9, flexWrap: "wrap" }}>
-                        <Checkbox on={false} onClick={() => toggle(p.id, i.id)} /><span style={{ flex: "1 1 120px", fontSize: 13 }}>{i.text}</span>
-                        {di && <span style={{ fontSize: 11, fontWeight: 700, color: di.color, whiteSpace: "nowrap" }}>{di.label}</span>}
-                        <TaskStatusPill status={i.status} /><AssigneeChip assignee={i.assignee} members={state.members} />
+                      <div key={i.id} style={{ display: "flex", alignItems: "center", gap: 9, padding: "8px 10px", background: C.bg, borderRadius: 9 }}>
+                        <Checkbox on={false} onClick={() => toggle(p.id, i.id)} />
+                        <span style={{ flex: 1, minWidth: 0, fontSize: 13 }}>{i.text}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                          {di && <span style={{ fontSize: 11, fontWeight: 700, color: di.color, whiteSpace: "nowrap" }}>{di.label}</span>}
+                          <TaskStatusPill status={i.status} /><AssigneeChip assignee={i.assignee} members={state.members} />
+                        </div>
                       </div>
                     ); })}
                     {open.length === 0 && <div style={{ fontSize: 12, color: C.green, padding: "2px 2px" }}>All done for this project 🎉</div>}
