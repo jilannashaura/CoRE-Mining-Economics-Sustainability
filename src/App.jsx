@@ -1257,7 +1257,7 @@ function ProjectModal({ project, members, currentUser, onSave, onClose }) {
   });
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   const toggleCollab = (m) => set("collaborators", f.collaborators.includes(m) ? f.collaborators.filter((x) => x !== m) : [...f.collaborators, m]);
-  const valid = f.name.trim() && f.kickoff && f.wrapup;
+  const valid = f.name.trim();
   const two = { display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 12 };
   return (
     <Modal onClose={onClose} title={project.id ? "Edit project" : "New project"} wide>
@@ -1284,18 +1284,17 @@ function ProjectModal({ project, members, currentUser, onSave, onClose }) {
           </div>
         </Field>
         <div style={two}>
-          <Field label="Kick-off *"><input type="date" value={f.kickoff} onChange={(e) => set("kickoff", e.target.value)} style={inputStyle} /></Field>
-          <Field label="Wrap-up target *"><input type="date" value={f.wrapup} onChange={(e) => set("wrapup", e.target.value)} style={inputStyle} /></Field>
+          <Field label="Kick-off"><input type="date" value={f.kickoff} onChange={(e) => set("kickoff", e.target.value)} style={inputStyle} /></Field>
+          <Field label="Wrap-up target"><input type="date" value={f.wrapup} onChange={(e) => set("wrapup", e.target.value)} style={inputStyle} /></Field>
         </div>
         <Field label="Description"><textarea value={f.description} onChange={(e) => set("description", e.target.value)} rows={3} style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5 }} placeholder="Scope, objectives…" /></Field>
         <Field label="Data room (link)"><TextInput value={f.dataRoom} onChange={(v) => set("dataRoom", v)} placeholder="https://drive.google.com/…" /></Field>
         <div style={{ fontSize: 11.5, color: C.muted }}>Tip: add milestones & the checklist after saving, from the project's detail view.</div>
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 }}>
-        <GhostButton onClick={onClose}>Cancel</GhostButton>
         <PrimaryButton onClick={() => onSave(f)} disabled={!valid}>{project.id ? "Save changes" : "Create project"}</PrimaryButton>
       </div>
-      {!valid && <div style={{ textAlign: "right", fontSize: 11, color: C.muted, marginTop: 8 }}>Name, kick-off and wrap-up are required.</div>}
+      {!valid && <div style={{ textAlign: "right", fontSize: 11, color: C.muted, marginTop: 8 }}>A project name is required.</div>}
     </Modal>
   );
 }
@@ -1437,20 +1436,31 @@ function ProjectGantt({ p }) {
   const pos = (t) => ((t - min) / span) * 100;
   const now = Date.now(); const nowPos = now >= min && now <= max ? pos(now) : null;
   const endT = new Date(p.wrapup + "T00:00:00").getTime();
+  const laid = points.map((x) => ({ ...x, pp: pos(new Date(x.date + "T00:00:00").getTime()) })).sort((a, b) => a.pp - b.pp);
+  const laneRight = [];
+  laid.forEach((x) => { let lvl = 0; while (laneRight[lvl] !== undefined && x.pp - laneRight[lvl] < 14) lvl++; laneRight[lvl] = x.pp; x.level = lvl; });
+  const maxLevel = laid.reduce((m, x) => Math.max(m, x.level), 0);
+  const STEP = 30, TOP = 26;
   return (
-    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "22px 26px 30px" }}>
-      <div style={{ position: "relative", height: 30 }}>
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: "24px 26px 20px" }}>
+      <div style={{ position: "relative", height: TOP + (maxLevel + 1) * STEP }}>
         <div style={{ position: "absolute", left: `${pos(times[0])}%`, right: `${100 - pos(endT)}%`, top: 12, height: 6, background: C.blueSoft, borderRadius: 4 }} />
         <div style={{ position: "absolute", left: `${pos(times[0])}%`, right: `${100 - pos(Math.min(now, max))}%`, top: 12, height: 6, background: C.blue, borderRadius: 4 }} />
-        {nowPos !== null && <div style={{ position: "absolute", left: `${nowPos}%`, top: 0, bottom: -18, width: 2, background: C.red }}><span style={{ position: "absolute", top: -16, left: -14, fontSize: 9, color: C.red, fontWeight: 700 }}>TODAY</span></div>}
-        {points.map((x, i) => {
-          const t = new Date(x.date + "T00:00:00").getTime(); const col = x.kind === "start" ? C.green : x.kind === "end" ? C.ink : C.amber;
+        {nowPos !== null && <div style={{ position: "absolute", left: `${nowPos}%`, top: -2, height: 24, width: 2, background: C.red }}><span style={{ position: "absolute", top: -15, left: "50%", transform: "translateX(-50%)", fontSize: 9, color: C.red, fontWeight: 700, whiteSpace: "nowrap" }}>TODAY</span></div>}
+        {laid.map((x, i) => {
+          const col = x.kind === "start" ? C.green : x.kind === "end" ? C.ink : C.amber;
+          const labelTop = TOP + x.level * STEP;
           return (
-            <div key={i} style={{ position: "absolute", left: `${pos(t)}%`, top: 6, transform: "translateX(-50%)", textAlign: "center" }}>
-              <div style={{ width: 14, height: 14, borderRadius: x.kind === "ms" ? 3 : "50%", background: col, border: "2px solid #fff", boxShadow: `0 0 0 1px ${col}`, transform: x.kind === "ms" ? "rotate(45deg)" : "none" }} />
-              <div style={{ marginTop: 10, fontSize: 10, fontWeight: 700, whiteSpace: "nowrap" }}>{x.name}</div>
-              <div className="mono" style={{ fontSize: 9, color: C.muted }}>{x.date.slice(5)}</div>
-            </div>
+            <React.Fragment key={i}>
+              {x.level > 0 && <div style={{ position: "absolute", left: `${x.pp}%`, top: 15, height: labelTop - 15, width: 1, background: C.line }} />}
+              <div style={{ position: "absolute", left: `${x.pp}%`, top: 8, transform: "translateX(-50%)" }}>
+                <div style={{ width: 13, height: 13, borderRadius: x.kind === "ms" ? 3 : "50%", background: col, border: "2px solid #fff", boxShadow: `0 0 0 1px ${col}`, transform: x.kind === "ms" ? "rotate(45deg)" : "none" }} />
+              </div>
+              <div style={{ position: "absolute", left: `${x.pp}%`, top: labelTop, transform: "translateX(-50%)", textAlign: "center", width: 88 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, lineHeight: 1.15 }}>{x.name}</div>
+                <div className="mono" style={{ fontSize: 9, color: C.muted }}>{x.date.slice(5)}</div>
+              </div>
+            </React.Fragment>
           );
         })}
       </div>
@@ -1489,7 +1499,7 @@ function Timeline({ state, actions, currentUser }) {
                   {MONTHS[m.getMonth()].slice(0, 3)} {String(m.getFullYear()).slice(2)}
                 </div>
               ))}
-              {nowPos !== null && <div style={{ position: "absolute", left: `${nowPos}%`, top: 0, transform: "translateX(-50%)", fontSize: 9, fontWeight: 700, color: C.red }}>TODAY</div>}
+              {nowPos !== null && <div style={{ position: "absolute", left: `${nowPos}%`, top: "50%", transform: "translate(-50%, -50%)", fontSize: 9, fontWeight: 700, color: C.red }}>TODAY</div>}
             </div>
           </div>
           {projects.map((p, idx) => {
@@ -2123,7 +2133,6 @@ function InvoiceModal({ project, defaultNumber, company, onGenerate, onClose }) 
         <b>Auto-filled:</b> Date · To: {project.client || "(client)"} · Project: {project.name}<br /><b>Placeholders in Word:</b> Address, Description, Amount, Amount in words<br /><b>Signed:</b> {company.city}, {prettyDate(date)} — {company.signer}
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 20 }}>
-        <GhostButton onClick={onClose}>Cancel</GhostButton>
         <PrimaryButton onClick={() => onGenerate(project, number, date)}><Download size={15} /> Download .doc</PrimaryButton>
       </div>
     </Modal>
@@ -2209,7 +2218,7 @@ function Avatar({ name, members, size = 26 }) {
   return <div style={{ width: size, height: size, borderRadius: "50%", background: bg + "22", color: bg, display: "grid", placeItems: "center", fontSize: size * 0.4, fontWeight: 700, flexShrink: 0 }}>{initials(name)}</div>;
 }
 function Checkbox({ on, onClick }) {
-  return <button onClick={onClick} style={{ width: 20, height: 20, borderRadius: 6, cursor: "pointer", border: `1.5px solid ${on ? C.green : C.faint}`, background: on ? C.green : "#fff", display: "grid", placeItems: "center", flexShrink: 0 }}>{on && <Check size={13} color="#fff" />}</button>;
+  return <button onClick={onClick} style={{ width: 20, height: 20, minWidth: 20, padding: 0, margin: 0, lineHeight: 0, borderRadius: 6, cursor: "pointer", border: `1.5px solid ${on ? C.green : C.faint}`, background: on ? C.green : "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0, appearance: "none", WebkitAppearance: "none" }}>{on && <Check size={13} color="#fff" strokeWidth={3} style={{ display: "block" }} />}</button>;
 }
 function AssigneeChip({ assignee, members }) {
   if (!assignee || assignee === "All") return <span style={{ fontSize: 10.5, fontWeight: 600, color: C.muted, background: C.slateSoft, borderRadius: 20, padding: "2px 9px", whiteSpace: "nowrap" }}>All</span>;
