@@ -785,7 +785,7 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
   const meta = REPORT_META[type];
   const canNav = !saved && (type === "weekly" || type === "monthly");
   const [period, setPeriod] = useState(() => saved ? { start: saved.start, end: saved.end } : reportRange(type));
-  const [savedMsg, setSavedMsg] = useState(false);
+  const [saveMsg, setSaveMsg] = useState("");
   const dataProjects = saved ? saved.snapshotProjects : state.projects;
   const dataTx = saved ? saved.snapshotTx : state.transactions;
   const active = dataProjects.filter((p) => !p.archived);
@@ -809,10 +809,14 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
     window.addEventListener("afterprint", cleanup);
     setTimeout(() => window.print(), 120);
   };
-  const saveToHistory = () => {
-    onSave && onSave({ id: uid(), type, start, end, generatedBy: currentUser || "", generatedAt: nowISO(),
-      snapshotProjects: JSON.parse(JSON.stringify(state.projects)), snapshotTx: JSON.parse(JSON.stringify(state.transactions)) });
-    setSavedMsg(true); setTimeout(() => setSavedMsg(false), 2500);
+  const saveToHistory = async () => {
+    if (!onSave) return;
+    setSaveMsg("saving");
+    try {
+      await onSave({ id: uid(), type, start, end, generatedBy: currentUser || "", generatedAt: nowISO(),
+        snapshotProjects: JSON.parse(JSON.stringify(state.projects)), snapshotTx: JSON.parse(JSON.stringify(state.transactions)) });
+      setSaveMsg("saved"); setTimeout(() => setSaveMsg((m) => m === "saved" ? "" : m), 2500);
+    } catch (e) { setSaveMsg("err:" + ((e && e.message) || "Couldn't save — is the 'reports' table set up in Supabase?")); }
   };
   const plus = (days) => isoOf(new Date(new Date(asOf + "T00:00:00").getTime() + days * 864e5));
 
@@ -911,8 +915,9 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
               <IconBtn small onClick={() => setPeriod((p) => shiftPeriod(type, p, 1))}><ChevronRight size={15} /></IconBtn>
             </div>
           )}
-          {canNav && <GhostButton onClick={saveToHistory}><Archive size={14} /> {savedMsg ? "Saved ✓" : "Save to history"}</GhostButton>}
+          {canNav && <GhostButton onClick={saveToHistory}><Archive size={14} /> {saveMsg === "saving" ? "Saving…" : saveMsg === "saved" ? "Saved ✓" : "Save to history"}</GhostButton>}
           <GhostButton onClick={onClose}>Close</GhostButton>
+          {saveMsg.startsWith("err:") && <span style={{ background: C.red, color: "#fff", borderRadius: 8, padding: "5px 9px", fontSize: 11, alignSelf: "center" }}>{saveMsg.slice(4)}</span>}
           <span style={{ marginLeft: "auto", color: "#fff", fontSize: 11.5, alignSelf: "center", maxWidth: 320 }}>
             {saved ? "Frozen snapshot from history." : canNav ? "Use ‹ › to view a past period, then Save to freeze it." : "On-demand snapshot."} PDF export needs the deployed site (this in-app preview can't open the print dialog).
           </span>
