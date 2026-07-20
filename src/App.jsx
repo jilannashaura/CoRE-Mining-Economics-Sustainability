@@ -78,6 +78,7 @@ function ago(iso) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 const assigneesOf = (p) => [p.pic, ...(p.collaborators || [])].filter(Boolean);
+const sameUser = (a, b) => (a || "").trim().toLowerCase() === (b || "").trim().toLowerCase();
 const TASK_STATUS = ["Not Started", "On Progress", "Finished"];
 const TASK_STATUS_META = {
   "Not Started": { color: C.slate, soft: C.slateSoft },
@@ -150,16 +151,15 @@ function GlobalStyle() {
     @keyframes fade { from { opacity: 0; transform: translateY(5px);} to { opacity:1; transform:none;} }
     .drag-over { background: ${C.blueSoft} !important; outline: 2px dashed ${C.blue}; }
     .report-page { background:#fff; border-radius:8px; width:794px; max-width:100%; height:1123px; box-sizing:border-box; padding:34px 32px; overflow:hidden; margin:0 auto 18px; }
+    .print-holder { display: none; }
     @media print {
-      body { background: #fff !important; }
-      body.printing-report * { visibility: hidden !important; }
-      body.printing-report .report-print, body.printing-report .report-print * { visibility: visible !important; }
-      body.printing-report .report-print { position: absolute; left: 0; top: 0; width: 100%; }
+      body { background:#fff !important; }
+      body.printing-report > *:not(.print-holder) { display: none !important; }
+      body.printing-report .print-holder { display: block !important; }
       .no-print { display: none !important; }
       @page { size: A4; margin: 0; }
-      .report-print { background:#fff !important; }
-      .report-page { width:210mm !important; height:297mm !important; padding:12mm !important; margin:0 !important; border-radius:0 !important; overflow:hidden !important; box-shadow:none !important; break-after:page; page-break-after:always; }
-      .report-page:last-child { break-after:auto; page-break-after:auto; }
+      .print-holder .report-page { width:210mm !important; height:297mm !important; padding:12mm !important; margin:0 !important; border-radius:0 !important; overflow:hidden !important; box-shadow:none !important; break-after:page; page-break-after:always; }
+      .print-holder .report-page:last-child { break-after:auto; page-break-after:auto; }
     }
   `;
   return <style dangerouslySetInnerHTML={{ __html: css }} />;
@@ -591,11 +591,11 @@ function AnnouncementPost({ a, members, currentUser, onDelete, onEdit, onComment
 /* ------------------------------ Personal ------------------------------ */
 const NOTIF_ICON = { assigned_project: UserPlus, tagged: AtSign, assigned_task: ListChecks, status_change: GanttChartSquare };
 function Personal({ state, actions, currentUser, setTab }) {
-  const mine = (state.notifications || []).filter((n) => n.to === currentUser).slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const mine = (state.notifications || []).filter((n) => sameUser(n.to, currentUser)).slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const [showAll, setShowAll] = useState(false);
   const shown = showAll ? mine : mine.slice(0, 3);
   const dismiss = (id) => actions.dismissNotif(id);
-  const myProjects = state.projects.filter((p) => !p.archived && assigneesOf(p).includes(currentUser));
+  const myProjects = state.projects.filter((p) => !p.archived && assigneesOf(p).some((m) => sameUser(m, currentUser)));
   const [detail, setDetail] = useState(null);
 
   return (
@@ -791,12 +791,24 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
   const active = dataProjects.filter((p) => !p.archived);
   const start = period.start, end = period.end;
   const asOf = end; // date-relative calcs anchor to the end of the reported window
+  const printRef = React.useRef(null);
   useEffect(() => {
-    const after = () => document.body.classList.remove("printing-report");
-    window.addEventListener("afterprint", after);
-    return () => { window.removeEventListener("afterprint", after); document.body.classList.remove("printing-report"); };
+    return () => { document.body.classList.remove("printing-report"); document.querySelectorAll(".print-holder").forEach((n) => n.remove()); };
   }, []);
-  const doPrint = () => { document.body.classList.add("printing-report"); setTimeout(() => window.print(), 60); };
+  const doPrint = () => {
+    const src = printRef.current;
+    if (!src) { window.print(); return; }
+    document.querySelectorAll(".print-holder").forEach((n) => n.remove());
+    const holder = document.createElement("div");
+    holder.className = "print-holder ui";
+    try { holder.style.fontFamily = getComputedStyle(src).fontFamily; } catch (e) {}
+    holder.innerHTML = src.innerHTML;
+    document.body.appendChild(holder);
+    document.body.classList.add("printing-report");
+    const cleanup = () => { document.body.classList.remove("printing-report"); const h = document.querySelector(".print-holder"); if (h) h.remove(); window.removeEventListener("afterprint", cleanup); };
+    window.addEventListener("afterprint", cleanup);
+    setTimeout(() => window.print(), 120);
+  };
   const saveToHistory = () => {
     onSave && onSave({ id: uid(), type, start, end, generatedBy: currentUser || "", generatedAt: nowISO(),
       snapshotProjects: JSON.parse(JSON.stringify(state.projects)), snapshotTx: JSON.parse(JSON.stringify(state.transactions)) });
@@ -906,7 +918,7 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
           </span>
         </div>
 
-        <div className="report-print ui" style={{ background: C.bg }}>
+        <div ref={printRef} className="report-print ui" style={{ background: C.bg }}>
           {/* PAGE 1 — project snapshot */}
           <div className="report-page">
             <PageHead suffix="" />

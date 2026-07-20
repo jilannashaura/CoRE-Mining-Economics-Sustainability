@@ -134,13 +134,16 @@ create policy "authenticated all" on public.reports
   for all to authenticated using (true) with check (true);
 
 -- ---------- realtime (live sync between teammates) ----------
-alter publication supabase_realtime add table public.settings;
-alter publication supabase_realtime add table public.projects;
-alter publication supabase_realtime add table public.invoices;
-alter publication supabase_realtime add table public.announcements;
-alter publication supabase_realtime add table public.notifications;
-alter publication supabase_realtime add table public.transactions;
-alter publication supabase_realtime add table public.reports;
+do $$
+declare t text;
+begin
+  foreach t in array array['settings','projects','invoices','announcements','notifications','transactions','reports'] loop
+    begin
+      execute format('alter publication supabase_realtime add table public.%I', t);
+    exception when duplicate_object then null;
+    end;
+  end loop;
+end $$;
 
 -- ---------- seed the single settings row ----------
 insert into public.settings (id, company, members)
