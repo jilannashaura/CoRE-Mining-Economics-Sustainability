@@ -154,6 +154,7 @@ function GlobalStyle() {
     .print-holder { display: none; }
     @media print {
       body { background:#fff !important; }
+      body, .print-holder, .print-holder * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; color-adjust: exact !important; }
       body.printing-report > *:not(.print-holder) { display: none !important; }
       body.printing-report .print-holder { display: block !important; }
       .no-print { display: none !important; }
@@ -805,7 +806,9 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
     holder.innerHTML = src.innerHTML;
     document.body.appendChild(holder);
     document.body.classList.add("printing-report");
-    const cleanup = () => { document.body.classList.remove("printing-report"); const h = document.querySelector(".print-holder"); if (h) h.remove(); window.removeEventListener("afterprint", cleanup); };
+    const prevTitle = document.title;
+    document.title = `${meta.tag} Report_${end}`;
+    const cleanup = () => { document.body.classList.remove("printing-report"); document.title = prevTitle; const h = document.querySelector(".print-holder"); if (h) h.remove(); window.removeEventListener("afterprint", cleanup); };
     window.addEventListener("afterprint", cleanup);
     setTimeout(() => window.print(), 120);
   };
