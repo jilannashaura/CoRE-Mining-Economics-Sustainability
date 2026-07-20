@@ -144,7 +144,8 @@ export async function listReports() {
   if (error) throw error; return (data || []).map(repToApp);
 }
 export async function insertReport(r) {
-  const row = { id: r.id || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())), type: r.type, start_date: r.start, end_date: r.end,
+  const id = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + "-" + Math.random().toString(16).slice(2));
+  const row = { id, type: r.type, start_date: r.start, end_date: r.end,
     generated_by: r.generatedBy || "", generated_at: r.generatedAt || new Date().toISOString(),
     snapshot: { projects: r.snapshotProjects || [], transactions: r.snapshotTx || [] } };
   const { data, error } = await supabase.from("reports").insert(row).select().single();
