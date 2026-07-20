@@ -149,15 +149,17 @@ function GlobalStyle() {
     .fade { animation: fade .2s ease; }
     @keyframes fade { from { opacity: 0; transform: translateY(5px);} to { opacity:1; transform:none;} }
     .drag-over { background: ${C.blueSoft} !important; outline: 2px dashed ${C.blue}; }
+    .report-page { background:#fff; border-radius:8px; width:794px; max-width:100%; height:1123px; box-sizing:border-box; padding:34px 32px; overflow:hidden; margin:0 auto 18px; }
     @media print {
       body { background: #fff !important; }
       body.printing-report * { visibility: hidden !important; }
       body.printing-report .report-print, body.printing-report .report-print * { visibility: visible !important; }
       body.printing-report .report-print { position: absolute; left: 0; top: 0; width: 100%; }
       .no-print { display: none !important; }
-      .report-page { break-after: page; page-break-after: always; }
-      .report-page:last-child { break-after: auto; page-break-after: auto; }
-      @page { size: A4; margin: 11mm; }
+      @page { size: A4; margin: 0; }
+      .report-print { background:#fff !important; }
+      .report-page { width:210mm !important; height:297mm !important; padding:12mm !important; margin:0 !important; border-radius:0 !important; overflow:hidden !important; box-shadow:none !important; break-after:page; page-break-after:always; }
+      .report-page:last-child { break-after:auto; page-break-after:auto; }
     }
   `;
   return <style dangerouslySetInnerHTML={{ __html: css }} />;
@@ -906,7 +908,7 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
 
         <div className="report-print ui" style={{ background: C.bg }}>
           {/* PAGE 1 — project snapshot */}
-          <div className="report-page" style={{ background: "#fff", padding: 26, borderRadius: 8 }}>
+          <div className="report-page">
             <PageHead suffix="" />
             <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
               <div style={box}>
@@ -958,7 +960,8 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
             <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 14 }}>
               <thead><tr>{["Date", "Event", "Project", "PIC"].map((h) => <th key={h} style={th}>{h}</th>)}</tr></thead>
               <tbody>
-                {in14.map((e, i) => <tr key={i}><td style={td}>{e.date}</td><td style={td}>{e.kind}</td><td style={{ ...td, color: C.blue }}>{e.project.name}</td><td style={td}>{e.project.pic || "—"}</td></tr>)}
+                {in14.slice(0, 8).map((e, i) => <tr key={i}><td style={td}>{e.date}</td><td style={td}>{e.kind}</td><td style={{ ...td, color: C.blue }}>{e.project.name}</td><td style={td}>{e.project.pic || "—"}</td></tr>)}
+                {in14.length > 8 && <tr><td style={{ ...td, color: C.muted }} colSpan={4}>+{in14.length - 8} more…</td></tr>}
                 {in14.length === 0 && <tr><td style={td} colSpan={4}>No events in the next 14 days.</td></tr>}
               </tbody>
             </table>
@@ -971,7 +974,7 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
           </div>
 
           {/* PAGE 2 — balance snapshot */}
-          <div className="report-page" style={{ background: "#fff", padding: 26, borderRadius: 8, marginTop: 20 }}>
+          <div className="report-page">
             <PageHead suffix=" — Balance" />
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 16 }}>
               <SummaryCard icon={Wallet} tone={C.green} label="Current Balance" value={fmtRp(balance)} sub="All-time balance" />
@@ -1257,7 +1260,12 @@ function ProjectModal({ project, members, currentUser, onSave, onClose }) {
   });
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   const toggleCollab = (m) => set("collaborators", f.collaborators.includes(m) ? f.collaborators.filter((x) => x !== m) : [...f.collaborators, m]);
-  const valid = f.name.trim();
+  const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
+  const submit = async () => {
+    if (!f.name.trim()) { setErr("Please enter a project name."); return; }
+    setBusy(true); setErr("");
+    try { await onSave(f); } catch (e) { setErr((e && e.message) || "Couldn't save — check your connection and that the database schema is up to date."); setBusy(false); }
+  };
   const two = { display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 12 };
   return (
     <Modal onClose={onClose} title={project.id ? "Edit project" : "New project"} wide>
@@ -1292,9 +1300,10 @@ function ProjectModal({ project, members, currentUser, onSave, onClose }) {
         <div style={{ fontSize: 11.5, color: C.muted }}>Tip: add milestones & the checklist after saving, from the project's detail view.</div>
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 }}>
-        <PrimaryButton onClick={() => onSave(f)} disabled={!valid}>{project.id ? "Save changes" : "Create project"}</PrimaryButton>
+        <PrimaryButton onClick={submit} disabled={busy}>{busy ? "Saving…" : (project.id ? "Save changes" : "Create project")}</PrimaryButton>
       </div>
-      {!valid && <div style={{ textAlign: "right", fontSize: 11, color: C.muted, marginTop: 8 }}>A project name is required.</div>}
+      {err ? <div style={{ textAlign: "right", fontSize: 11.5, color: C.red, marginTop: 8 }}>{err}</div>
+        : (!f.name.trim() && <div style={{ textAlign: "right", fontSize: 11, color: C.muted, marginTop: 8 }}>A project name is required.</div>)}
     </Modal>
   );
 }
