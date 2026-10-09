@@ -2,13 +2,14 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from "react"
 import {
   LayoutDashboard, FolderKanban, GanttChartSquare, ReceiptText, Settings, LogOut, Plus,
   Search, Pencil, Trash2, ExternalLink, X, Lock, Users, Clock, Eye, CircleDot,
-  CheckCircle2, ChevronRight, Sparkles, FileText, Flag, Check, Calendar, UsersRound,
+  CheckCircle2, ChevronRight, Sparkles, FileText, Flag, Check, Calendar, UsersRound, EyeOff, Wifi,
   Download, ListChecks, Menu, Archive, ArchiveRestore, UserCircle, Bell, Megaphone, AtSign, UserPlus,
-  Wallet, ArrowUpRight, ArrowDownRight, TrendingUp, Upload, FileSpreadsheet, ChevronLeft, Link2, Coins, Wifi, Mail, LogIn
+  Wallet, ArrowUpRight, ArrowDownRight, TrendingUp, Upload, FileSpreadsheet, ChevronLeft, Link2, Coins
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell, PieChart, Pie, Legend
 } from "recharts";
+import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
 import * as db from "./db";
 
@@ -36,13 +37,35 @@ const STATUS_META = {
   "Finished":  { color: C.green, soft: C.greenSoft, icon: CheckCircle2 },
 };
 const CATEGORY_COLOR = { "Project": C.blue, "Research": C.amber, "Training": C.violet };
+const SUB_STATUS = {
+  "Prospect": ["Awaiting Potential User", "To Be Proposed", "Under Discussion"],
+  "On Going": ["Idle", "On Progress"],
+  "On Review": ["Reviewed by FRB", "Reviewed by User"],
+  "Finished": ["To Be Invoiced", "Invoiced", "Closed"],
+};
+const PRIORITIES = ["Critical", "Urgent", "Moderate", "Minor"];
+const PRIORITY_META = {
+  "Critical": { color: "#DC2626", soft: "#FDECEC" },
+  "Urgent":   { color: "#EA580C", soft: "#FEEFE2" },
+  "Moderate": { color: C.blue,    soft: C.blueSoft },
+  "Minor":    { color: C.slate,   soft: C.slateSoft },
+};
+const isHotPriority = (p) => p && (p.priority === "Critical" || p.priority === "Urgent");
 
-export const DEFAULT_COMPANY = { name: "Unit Cost Research Team", address: "", email: "",
+const KEY = "pmt:state:v2";
+const SESSION_KEY = "pmt:session:v1";
+const AdminCtx = React.createContext({ unlocked: false, unlock: async () => false, lock: () => {} });
+const useAdmin = () => React.useContext(AdminCtx);
+const DEFAULT_COMPANY = { name: "Unit Cost Research Team", address: "", email: "",
   currency: "Rp", city: "Bandung", signer: "Firly Rachmaditya Baskoro" };
 
 /* ------------------------------ helpers ------------------------------ */
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const newId = () => (crypto.randomUUID ? crypto.randomUUID() : uid() + uid());
+const uid = () => {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  const b = new Uint8Array(16); crypto.getRandomValues(b); b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128;
+  const h = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+};
 const fmtNum = (n) => new Intl.NumberFormat("en-US").format(Number(n) || 0);
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
@@ -79,6 +102,11 @@ function ago(iso) {
 }
 const assigneesOf = (p) => [p.pic, ...(p.collaborators || [])].filter(Boolean);
 const sameUser = (a, b) => (a || "").trim().toLowerCase() === (b || "").trim().toLowerCase();
+// who to notify about a project change: whole team if Critical/Urgent, else just PIC + collaborators
+const notifyTargets = (p, members) => {
+  const base = isHotPriority(p) ? Array.from(new Set([...(members || []), ...assigneesOf(p)])) : assigneesOf(p);
+  return base.filter(Boolean);
+};
 const TASK_STATUS = ["Not Started", "On Progress", "Finished"];
 const TASK_STATUS_META = {
   "Not Started": { color: C.slate, soft: C.slateSoft },
@@ -112,10 +140,43 @@ function mentionNodes(text, members) {
   return parts;
 }
 
-const notifFresh = (n) => (Date.now() - new Date(n.createdAt).getTime()) < NOTIF_DAYS * 864e5;
+async function sha256(str) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function loadState() {
+  try { const r = await window.storage.get(KEY, true); if (r && r.value) return JSON.parse(r.value); } catch (e) {}
+  return null;
+}
+async function saveState(s) { try { await window.storage.set(KEY, JSON.stringify(s), true); } catch (e) { console.error(e); } }
+function normalize(s) {
+  const projects = (s.projects || []).map((p) => {
+    const q = { client: "", collaborators: [], milestones: [], checklist: [], kickoff: "", wrapup: "",
+      source: "", pic: "", description: "", dataRoom: "", archived: false, archivedAt: "", finishedAt: "",
+      subStatus: "", priority: "Moderate", ...p };
+    q.checklist = (q.checklist || []).map((i) => {
+      const it = { assignee: "All", dueDate: "", ...i };
+      it.status = i.status || (i.done ? "Finished" : "Not Started");
+      it.done = it.status === "Finished";
+      return it;
+    });
+    if (q.status === "Finished" && !q.finishedAt) q.finishedAt = q.updatedAt || q.createdAt || todayISO();
+    return q;
+  });
+  const announcements = (s.announcements || []).map((a) => ({ editedAt: null, comments: [], tags: [], ...a }));
+  return { ...s, company: { ...DEFAULT_COMPANY, ...(s.company || {}) }, invoices: s.invoices || [], members: s.members || [], accounts: s.accounts || [],
+    announcements, notifications: s.notifications || [], transactions: s.transactions || [], reports: s.reports || [], projects };
+}
+function cleanupNotifs(state) {
+  const cut = Date.now() - NOTIF_DAYS * 864e5;
+  return { ...state, notifications: (state.notifications || []).filter((n) => new Date(n.createdAt).getTime() >= cut) };
+}
 const ARCHIVE_DAYS = 30;
 const isAutoArchivable = (p) => !p.archived && p.status === "Finished" && p.finishedAt &&
   (Date.now() - new Date(p.finishedAt + "T00:00:00").getTime()) >= ARCHIVE_DAYS * 864e5;
+function autoArchive(state) {
+  return { ...state, projects: state.projects.map((p) => isAutoArchivable(p) ? { ...p, archived: true, archivedAt: todayISO() } : p) };
+}
 // keeps finishedAt / archive flags consistent whenever a project's status changes
 function withStatusMeta(p) {
   if (p.status === "Finished") return { ...p, finishedAt: p.finishedAt || todayISO() };
@@ -167,28 +228,76 @@ function GlobalStyle() {
 }
 
 /* =================================================================== */
+/* ============================================================
+   Netlify / Supabase wrapper.
+   Every view below is identical to the in-Claude preview: they all read one
+   `state` object and change it with `update(prev => patch)`. Here `update`
+   also diffs the change and writes it to Supabase; realtime keeps everyone
+   in sync.
+   ============================================================ */
+const COLLECTIONS = ["projects", "invoices", "announcements", "notifications", "transactions", "reports"];
+const same = (a, b) => a === b || JSON.stringify(a) === JSON.stringify(b);
+
+async function persistDiff(prev, next) {
+  const jobs = [];
+  const newNotifs = [];
+  for (const key of COLLECTIONS) {
+    const a = prev[key] || [], b = next[key] || [];
+    if (a === b) continue;
+    const A = new Map(a.map((x) => [x.id, x])), B = new Map(b.map((x) => [x.id, x]));
+    for (const [id, x] of B) {
+      const old = A.get(id);
+      if (old && same(old, x)) continue;
+      const isNew = !old;
+      if (key === "projects") jobs.push(db.upsertProject(x));
+      else if (key === "invoices") jobs.push(db.upsertInvoice(x));
+      else if (key === "announcements") jobs.push(db.insertAnnouncement(x));
+      else if (key === "transactions") jobs.push(db.upsertTransaction(x));
+      else if (key === "notifications") { if (isNew) newNotifs.push(x); }
+      else if (key === "reports") { if (isNew) jobs.push(db.insertReport(x)); }
+    }
+    for (const [id] of A) {
+      if (B.has(id)) continue;
+      if (key === "projects") jobs.push(db.deleteProject(id));
+      else if (key === "invoices") jobs.push(db.deleteInvoice(id));
+      else if (key === "announcements") jobs.push(db.deleteAnnouncement(id));
+      else if (key === "transactions") jobs.push(db.deleteTransaction(id));
+      else if (key === "notifications") jobs.push(db.deleteNotification(id));
+      else if (key === "reports") jobs.push(db.deleteReport(id));
+    }
+  }
+  if (newNotifs.length) jobs.push(db.insertNotifications(newNotifs));
+  if (!same(prev.company, next.company) || !same(prev.members, next.members)) jobs.push(db.upsertSettings({ company: next.company, members: next.members }));
+  const res = await Promise.allSettled(jobs);
+  const fail = res.find((r) => r.status === "rejected");
+  if (fail) throw fail.reason;
+}
+
+const REFETCH = {
+  settings: async () => { const s = await db.getSettings(); return { company: { ...DEFAULT_COMPANY, ...(s.company || {}) }, members: s.members || [] }; },
+  projects: async () => ({ projects: normalize({ projects: await db.listProjects() }).projects }),
+  invoices: async () => ({ invoices: await db.listInvoices() }),
+  announcements: async () => ({ announcements: normalize({ announcements: await db.listAnnouncements() }).announcements }),
+  notifications: async () => ({ notifications: cleanupNotifs({ notifications: await db.listNotifications() }).notifications }),
+  transactions: async () => ({ transactions: await db.listTransactions() }),
+  reports: async () => ({ reports: await db.listReports() }),
+  team_members: async () => ({ accounts: await db.listTeamMembers() }),
+};
+
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [session, setSession] = useState(null);
-  const [loadingData, setLoadingData] = useState(true);
-  const [company, setCompany] = useState(DEFAULT_COMPANY);
-  const [members, setMembers] = useState([]);
-  const [projects, setProjects] = useState([]);
-  const [invoices, setInvoices] = useState([]);
-  const [announcements, setAnnouncements] = useState([]);
-  const [notifications, setNotifications] = useState([]);
-  const [transactions, setTransactions] = useState([]);
-  const [reports, setReports] = useState([]);
-  const [tab, setTab] = useState("dashboard");
+  const [codeOkFor, setCodeOkFor] = useState(null); // user id that entered the access code this page-load
+  const [state, setState] = useState(null);
+  const [loadErr, setLoadErr] = useState("");
+  const [syncErr, setSyncErr] = useState("");
+  const [adminOn, setAdminOn] = useState(false);
   const [live, setLive] = useState(false);
+  const [tab, setTab] = useState("dashboard");
   const [navOpen, setNavOpen] = useState(false);
   const isMobile = useIsMobile();
-
-  const projRef = useRef(projects); useEffect(() => { projRef.current = projects; }, [projects]);
-  const compRef = useRef(company); useEffect(() => { compRef.current = company; }, [company]);
-  const memRef = useRef(members); useEffect(() => { memRef.current = members; }, [members]);
-  const txRef = useRef(transactions); useEffect(() => { txRef.current = transactions; }, [transactions]);
-  const annRef = useRef(announcements); useEffect(() => { annRef.current = announcements; }, [announcements]);
+  const stateRef = useRef(null);
+  const setAll = (s) => { stateRef.current = s; setState(s); };
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => { setSession(data.session); setAuthReady(true); });
@@ -196,117 +305,112 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  const refetchSettings = useCallback(async () => { const s = await db.getSettings(); setCompany(s.company); setMembers(s.members); }, []);
-  const refetchProjects = useCallback(async () => {
-    let list = await db.listProjects();
-    const need = list.filter(isAutoArchivable);
-    if (need.length) {
-      await Promise.all(need.map((p) => db.upsertProject({ ...p, archived: true, archivedAt: todayISO() })));
-      const ids = new Set(need.map((p) => p.id));
-      list = list.map((p) => ids.has(p.id) ? { ...p, archived: true, archivedAt: todayISO() } : p);
-    }
-    setProjects(list);
+  const user = session ? session.user : null;
+  const userId = user ? user.id : null;
+  const codeOk = !!userId && codeOkFor === userId;
+  const currentUser = user ? ((user.user_metadata && user.user_metadata.full_name) || user.email) : "";
+
+  const update = useCallback((patch) => {
+    const prev = stateRef.current;
+    if (!prev) return Promise.resolve();
+    const delta = typeof patch === "function" ? patch(prev) : patch;
+    const next = { ...prev, ...(delta || {}) };
+    setAll(next);
+    const p = persistDiff(prev, next);
+    p.catch((e) => { console.error(e); setSyncErr((e && e.message) || "A change couldn't be saved."); });
+    return p;
   }, []);
-  const refetchInvoices = useCallback(async () => { setInvoices(await db.listInvoices()); }, []);
-  const refetchAnnouncements = useCallback(async () => { setAnnouncements(await db.listAnnouncements()); }, []);
-  const refetchNotifications = useCallback(async () => { setNotifications((await db.listNotifications()).filter(notifFresh)); }, []);
-  const refetchTransactions = useCallback(async () => { setTransactions(await db.listTransactions()); }, []);
-  const refetchReports = useCallback(async () => { setReports(await db.listReports()); }, []);
+
+  // load everything once the access code has been entered
+  const loadAll = useCallback(async () => {
+    setLoadErr("");
+    try {
+      const [st, projects, invoices, announcements, notifications, transactions, reports, accounts] = await Promise.all([
+        db.getSettings(), db.listProjects(), db.listInvoices(), db.listAnnouncements(), db.listNotifications(),
+        db.listTransactions(), db.listReports(), db.listTeamMembers().catch(() => []),
+      ]);
+      const loaded = normalize({ company: st.company, members: st.members, projects, invoices, announcements, notifications, transactions, reports, accounts });
+      let next = cleanupNotifs(autoArchive(loaded));
+      if (currentUser && !(next.members || []).some((m) => sameUser(m, currentUser))) next = { ...next, members: [...(next.members || []), currentUser] };
+      setAll(next);
+      persistDiff(loaded, next).catch((e) => console.error(e)); // auto-archive, stale notifications, add me to members
+    } catch (e) {
+      console.error(e);
+      setLoadErr((e && e.message) || "Couldn't load the workspace.");
+    }
+  }, [currentUser]);
 
   useEffect(() => {
-    if (!session) return;
-    let active = true;
-    (async () => { setLoadingData(true); try { await Promise.all([refetchSettings(), refetchProjects(), refetchInvoices(), refetchAnnouncements(), refetchNotifications(), refetchTransactions(), refetchReports()]); } catch (e) { console.error(e); } if (active) setLoadingData(false); })();
-    const ch = supabase.channel("rt-" + Math.random().toString(36).slice(2))
-      .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, refetchSettings)
-      .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, refetchProjects)
-      .on("postgres_changes", { event: "*", schema: "public", table: "invoices" }, refetchInvoices)
-      .on("postgres_changes", { event: "*", schema: "public", table: "announcements" }, refetchAnnouncements)
-      .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, refetchNotifications)
-      .on("postgres_changes", { event: "*", schema: "public", table: "transactions" }, refetchTransactions)
-      .on("postgres_changes", { event: "*", schema: "public", table: "reports" }, refetchReports)
-      .subscribe((st) => setLive(st === "SUBSCRIBED"));
-    return () => { active = false; supabase.removeChannel(ch); setLive(false); };
-  }, [session, refetchSettings, refetchProjects, refetchInvoices, refetchAnnouncements, refetchNotifications, refetchTransactions, refetchReports]);
+    if (!codeOk) return;
+    let alive = true;
+    loadAll();
+    const timers = {};
+    const refetch = (table) => () => {
+      clearTimeout(timers[table]);
+      timers[table] = setTimeout(async () => {
+        try { const patch = await REFETCH[table](); if (alive && stateRef.current) setAll({ ...stateRef.current, ...patch }); } catch (e) { console.error(e); }
+      }, 250);
+    };
+    let ch = supabase.channel("rt-" + Math.random().toString(36).slice(2));
+    Object.keys(REFETCH).forEach((t) => { ch = ch.on("postgres_changes", { event: "*", schema: "public", table: t }, refetch(t)); });
+    ch.subscribe((st) => setLive(st === "SUBSCRIBED"));
+    return () => { alive = false; Object.values(timers).forEach(clearTimeout); supabase.removeChannel(ch); setLive(false); };
+  }, [codeOk, loadAll]);
 
-  const currentUser = session ? (session.user.user_metadata?.full_name || session.user.email) : "";
-
-  const emitNotifs = async (list) => {
-    if (!list.length) return;
-    const rows = list.map((n) => ({ ...n, id: newId(), createdAt: nowISO() }));
-    setNotifications((prev) => [...rows, ...prev]);
-    try { await db.insertNotifications(rows); } catch (e) { console.error(e); }
-  };
-
-  const actions = useMemo(() => ({
-    async saveProject(p) {
-      const old = p.id ? projRef.current.find((x) => x.id === p.id) : null;
-      const base = old || { createdBy: currentUser };
-      const merged = withStatusMeta({ ...base, ...p, id: p.id || newId() });
-      const saved = await db.upsertProject(merged);
-      setProjects((prev) => prev.some((x) => x.id === saved.id) ? prev.map((x) => x.id === saved.id ? saved : x) : [saved, ...prev]);
-      const before = old ? assigneesOf(old) : [];
-      const added = assigneesOf(saved).filter((m) => !before.includes(m));
-      const notifs = added.map((m) => mkNotif(m, "assigned_project", `${currentUser} added you to \u201C${saved.name}\u201D as ${m === saved.pic ? "PIC" : "collaborator"}`, saved.id));
-      if (old && old.status !== saved.status) assigneesOf(saved).forEach((m) => notifs.push(mkNotif(m, "status_change", `${currentUser} moved \u201C${saved.name}\u201D to ${saved.status}`, saved.id)));
-      await emitNotifs(notifs);
+  const admin = useMemo(() => ({
+    unlocked: adminOn,
+    unlock: async (code) => {
+      const { data, error } = await supabase.rpc("check_admin", { code: (code || "").trim() });
+      if (error) { console.error(error); return false; }
+      const ok = data === true; if (ok) setAdminOn(true); return ok;
     },
-    async deleteProject(id) { await db.deleteProject(id); setProjects((prev) => prev.filter((x) => x.id !== id)); },
-    async moveStatus(id, status) {
-      const p = projRef.current.find((x) => x.id === id); if (!p) return;
-      const upd = withStatusMeta({ ...p, status }); setProjects((prev) => prev.map((x) => x.id === id ? upd : x));
-      try { await db.upsertProject(upd); } catch (e) { console.error(e); }
-      await emitNotifs(assigneesOf(upd).map((m) => mkNotif(m, "status_change", `${currentUser} moved \u201C${p.name}\u201D to ${status}`, id)));
-    },
-    async patchProject(id, patch) { const p = projRef.current.find((x) => x.id === id); if (!p) return; const upd = { ...p, ...patch }; setProjects((prev) => prev.map((x) => x.id === id ? upd : x)); try { await db.upsertProject(upd); } catch (e) { console.error(e); } },
-    async addTask(projectId, item) {
-      const p = projRef.current.find((x) => x.id === projectId); if (!p) return;
-      const upd = { ...p, checklist: [...(p.checklist || []), item] }; setProjects((prev) => prev.map((x) => x.id === projectId ? upd : x));
-      try { await db.upsertProject(upd); } catch (e) { console.error(e); }
-      if (item.assignee && item.assignee !== "All") await emitNotifs([mkNotif(item.assignee, "assigned_task", `${currentUser} assigned you a task in \u201C${p.name}\u201D`, projectId)]);
-    },
-    async addInvoice(inv) { const saved = await db.insertInvoice({ ...inv, id: newId() }); setInvoices((prev) => [saved, ...prev]); },
-    async deleteInvoice(id) { await db.deleteInvoice(id); setInvoices((prev) => prev.filter((x) => x.id !== id)); },
-    async saveSettings(patch) { const next = { company: patch.company ?? compRef.current, members: patch.members ?? memRef.current }; setCompany(next.company); setMembers(next.members); try { await db.upsertSettings(next); } catch (e) { console.error(e); } },
-    async postAnnouncement({ text, expiresAt, tags }) {
-      const a = { id: newId(), author: currentUser, text, createdAt: nowISO(), expiresAt: expiresAt || null, tags: tags || [], editedAt: null, comments: [] };
-      setAnnouncements((prev) => [a, ...prev]);
-      try { await db.insertAnnouncement(a); } catch (e) { console.error(e); }
-      await emitNotifs((tags || []).map((m) => mkNotif(m, "tagged", `${currentUser} tagged you in an announcement`)));
-    },
-    async updateAnnouncement(a) { setAnnouncements((prev) => prev.map((x) => x.id === a.id ? a : x)); try { await db.insertAnnouncement(a); } catch (e) { console.error(e); } },
-    async deleteAnnouncement(id) { setAnnouncements((prev) => prev.filter((a) => a.id !== id)); try { await db.deleteAnnouncement(id); } catch (e) { console.error(e); } },
-    async dismissNotif(id) { setNotifications((prev) => prev.filter((n) => n.id !== id)); try { await db.deleteNotification(id); } catch (e) { console.error(e); } },
-    async addTransaction(tx) { const saved = await db.insertTransaction({ ...tx, id: newId(), createdBy: currentUser, createdAt: nowISO() }); setTransactions((prev) => [saved, ...prev]); },
-    async deleteTransaction(id) { await db.deleteTransaction(id); setTransactions((prev) => prev.filter((t) => t.id !== id)); },
-    async saveReport(r) { const saved = await db.insertReport({ ...r, generatedBy: currentUser }); setReports((prev) => [saved, ...prev]); },
-    async deleteReport(id) { await db.deleteReport(id); setReports((prev) => prev.filter((r) => r.id !== id)); },
-  }), [currentUser]);
+    lock: () => setAdminOn(false),
+  }), [adminOn]);
 
-  if (!authReady) return <Splash text="Starting up…" />;
-  if (!session) return <Auth />;
-  if (loadingData) return <Splash text="Loading workspace…" />;
+  const signOut = async () => { setAdminOn(false); setCodeOkFor(null); setAll(null); setTab("dashboard"); await supabase.auth.signOut(); };
 
-  const state = { company, members, projects, invoices, announcements, notifications, transactions, reports };
+  if (!authReady) return <Splash text="Loading…" />;
+  if (!session) return <Auth onRegistered={(id) => setCodeOkFor(id)} />;
+  if (!codeOk) return <AccessCodeGate account={{ name: currentUser, email: user.email }} onPass={() => setCodeOkFor(userId)} onSignOut={signOut} />;
+  if (loadErr) return (
+    <AuthShell title="Couldn't load the workspace">
+      <div style={{ fontSize: 12.5, color: C.red }}>{loadErr}</div>
+      <div style={{ fontSize: 12, color: C.muted }}>If this mentions a missing table, column or function, run the latest supabase-schema.sql in Supabase → SQL Editor.</div>
+      <PrimaryButton onClick={loadAll} full>Try again</PrimaryButton>
+      <GhostButton onClick={signOut}>Sign out</GhostButton>
+    </AuthShell>
+  );
+  if (!state) return <Splash text="Loading workspace…" />;
+
+  const account = { id: userId, name: currentUser, email: user.email };
   const go = (t) => { setTab(t); setNavOpen(false); };
-  const nav = <Sidebar tab={tab} setTab={go} currentUser={currentUser} state={state} live={live} onSignOut={() => supabase.auth.signOut()} />;
+  const nav = <Sidebar tab={tab} setTab={go} currentUser={currentUser} state={state} live={live} onSignOut={signOut} />;
 
   const views = (
     <div style={{ maxWidth: 1240, margin: "0 auto", padding: isMobile ? "16px 15px 90px" : "34px 40px 90px" }}>
-      {tab === "dashboard" && <Dashboard state={state} actions={actions} currentUser={currentUser} setTab={go} />}
-      {tab === "personal" && <Personal state={state} actions={actions} currentUser={currentUser} setTab={go} />}
-      {tab === "projects" && <Projects state={state} actions={actions} currentUser={currentUser} />}
-      {tab === "timeline" && <Timeline state={state} actions={actions} currentUser={currentUser} />}
-      {tab === "todo" && <ToDo state={state} actions={actions} currentUser={currentUser} />}
-      {tab === "balance" && <Balance state={state} actions={actions} currentUser={currentUser} setTab={go} />}
-      {tab === "invoicing" && <Invoicing state={state} actions={actions} currentUser={currentUser} />}
-      {tab === "archive" && <ArchiveView state={state} actions={actions} currentUser={currentUser} />}
-      {tab === "settings" && <SettingsView state={state} actions={actions} session={session} />}
+      {syncErr && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, background: "#FDECEC", border: `1px solid ${C.red}`, color: C.red, padding: "10px 14px", borderRadius: 10, fontSize: 12.5, marginBottom: 16 }}>
+          <span style={{ flex: 1 }}>Couldn't save a change: {syncErr}</span>
+          <button onClick={() => { setSyncErr(""); loadAll(); }} style={{ ...linkBtn, fontSize: 12.5, color: C.red }}>Reload data</button>
+          <IconBtn small onClick={() => setSyncErr("")} title="Dismiss"><X size={14} /></IconBtn>
+        </div>
+      )}
+      {tab === "dashboard" && <Dashboard state={state} update={update} currentUser={currentUser} setTab={go} />}
+      {tab === "personal" && <Personal state={state} update={update} currentUser={currentUser} setTab={go} />}
+      {tab === "projects" && <Projects state={state} update={update} currentUser={currentUser} setTab={go} />}
+      {tab.startsWith("cat:") && <CategorySubpage category={tab.slice(4)} state={state} update={update} currentUser={currentUser} setTab={go} />}
+      {tab === "timeline" && <Timeline state={state} update={update} currentUser={currentUser} />}
+      {tab === "todo" && <ToDo state={state} update={update} currentUser={currentUser} />}
+      {tab === "balance" && (adminOn ? <Balance state={state} update={update} currentUser={currentUser} setTab={go} /> : <AdminGate title="Balance" />)}
+      {tab === "invoicing" && (adminOn ? <Invoicing state={state} update={update} currentUser={currentUser} /> : <AdminGate title="Invoicing" />)}
+      {tab === "archive" && <ArchiveView state={state} update={update} currentUser={currentUser} />}
+      {tab === "settings" && <SettingsView state={state} update={update} account={account} />}
       <Footer />
     </div>
   );
 
   if (isMobile) return (
+    <AdminCtx.Provider value={admin}>
     <div className="ui" style={{ minHeight: "100vh", background: C.bg, color: C.ink }}>
       <GlobalStyle />
       <div style={{ position: "sticky", top: 0, zIndex: 40, display: "flex", alignItems: "center", gap: 12,
@@ -317,19 +421,22 @@ export default function App() {
       </div>
       {navOpen && (
         <div onClick={() => setNavOpen(false)} style={{ position: "fixed", inset: 0, background: "#00000055", zIndex: 60 }}>
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 250, height: "100%", background: "#fff" }}>{nav}</div>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: 250, height: "100%", background: "#fff", overflowY: "auto" }}>{nav}</div>
         </div>
       )}
       <main>{views}</main>
     </div>
+    </AdminCtx.Provider>
   );
 
   return (
+    <AdminCtx.Provider value={admin}>
     <div className="ui" style={{ minHeight: "100vh", background: C.bg, color: C.ink, display: "flex" }}>
       <GlobalStyle />
       {nav}
       <main style={{ flex: 1, minWidth: 0, height: "100vh", overflowY: "auto" }}>{views}</main>
     </div>
+    </AdminCtx.Provider>
   );
 }
 
@@ -346,6 +453,7 @@ function Footer() {
 
 /* ------------------------------ Sidebar ------------------------------ */
 function Sidebar({ tab, setTab, currentUser, onSignOut, state, live }) {
+  const admin = useAdmin();
   return (
     <aside style={{ width: 236, background: C.sidebar, borderRight: `1px solid ${C.line}`, minHeight: "100vh",
       display: "flex", flexDirection: "column", padding: "20px 15px" }}>
@@ -366,31 +474,42 @@ function Sidebar({ tab, setTab, currentUser, onSignOut, state, live }) {
         ].map((it) => {
           const active = tab === it.id; const Icon = it.icon;
           return (
-            <button key={it.id} onClick={() => setTab(it.id)} style={{ display: "flex", alignItems: "center", gap: 11,
-              padding: "11px 13px", borderRadius: 12, border: "none", cursor: "pointer", textAlign: "left",
-              fontSize: 14, fontWeight: 600, background: active ? C.blue : "transparent",
-              color: active ? "#fff" : C.ink2, transition: "background .15s" }}>
-              <Icon size={18} color={active ? "#fff" : C.muted} /> {it.label}
-            </button>
+            <React.Fragment key={it.id}>
+              <button onClick={() => setTab(it.id)} style={{ display: "flex", alignItems: "center", gap: 11,
+                padding: "11px 13px", borderRadius: 12, border: "none", cursor: "pointer", textAlign: "left",
+                fontSize: 14, fontWeight: 600, background: active ? C.blue : "transparent",
+                color: active ? "#fff" : C.ink2, transition: "background .15s" }}>
+                <Icon size={18} color={active ? "#fff" : C.muted} /> {it.label}
+                {(it.id === "balance" || it.id === "invoicing") && !admin.unlocked && <Lock size={12} color={active ? "#fff" : C.faint} style={{ marginLeft: "auto" }} />}
+              </button>
+              {it.id === "projects" && CATEGORIES.map((c) => {
+                const cid = "cat:" + c; const on = tab === cid;
+                return (
+                  <button key={cid} onClick={() => setTab(cid)} style={{ display: "flex", alignItems: "center", gap: 9,
+                    margin: "1px 0 1px 24px", padding: "7px 11px", borderRadius: 10, border: "none", cursor: "pointer", textAlign: "left",
+                    fontSize: 12.5, fontWeight: 600, background: on ? C.blueSoft : "transparent", color: on ? C.blue : C.muted }}>
+                    <span style={{ width: 6, height: 6, borderRadius: 2, background: CATEGORY_COLOR[c] }} /> {c}
+                  </button>
+                );
+              })}
+            </React.Fragment>
           );
         })}
       </nav>
       <div style={{ marginTop: 24, padding: "0 6px" }}>
-        <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
-          <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 1, color: C.faint, textTransform: "uppercase" }}>Members</span>
-          <span title={live ? "Live sync on" : "Connecting…"} style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 4, fontSize: 9.5, color: live ? C.green : C.faint }}><Wifi size={12} /> {live ? "Live" : "…"}</span>
-        </div>
-        <div style={{ display: "grid", gap: 10 }}>
+        <div style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 1, color: C.faint, textTransform: "uppercase", marginBottom: 12 }}>Members</div>
+        <div style={{ display: "grid", gap: 10, maxHeight: 260, overflowY: "auto" }}>
           {(state.members || []).map((m) => (
             <div key={m} style={{ display: "flex", alignItems: "center", gap: 9 }}>
               <Avatar name={m} members={state.members} size={26} />
               <span style={{ fontSize: 12.5, color: C.ink2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m}</span>
-              {m === currentUser && <span style={{ width: 6, height: 6, borderRadius: 3, background: C.green, marginLeft: "auto" }} />}
+              {sameUser(m, currentUser) && <span style={{ width: 6, height: 6, borderRadius: 3, background: C.green, marginLeft: "auto", flexShrink: 0 }} />}
             </div>
           ))}
         </div>
       </div>
       <div style={{ marginTop: "auto", borderTop: `1px solid ${C.line}`, paddingTop: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: live ? C.green : C.faint, margin: "0 4px 10px" }}><Wifi size={12} /> {live ? "Live sync on" : "Connecting…"}</div>
         <button onClick={onSignOut} style={{ width: "100%", display: "flex", alignItems: "center", gap: 9,
           padding: "10px 12px", borderRadius: 10, border: `1px solid ${C.line}`, background: "transparent", color: C.ink2, cursor: "pointer", fontSize: 12.5 }}>
           <LogOut size={15} /> Sign out
@@ -400,36 +519,135 @@ function Sidebar({ tab, setTab, currentUser, onSignOut, state, live }) {
   );
 }
 
-/* ------------------------------ Auth (Supabase) ------------------------------ */
-function Auth() {
+/* ------------------------------ Auth ------------------------------ */
+function Auth({ onRegistered }) {
   const [mode, setMode] = useState("signin");
-  const [name, setName] = useState(""); const [email, setEmail] = useState(""); const [pass, setPass] = useState("");
+  const [f, setF] = useState({ name: "", email: "", pass: "", pass2: "", code: "" });
   const [err, setErr] = useState(""); const [info, setInfo] = useState(""); const [busy, setBusy] = useState(false);
-  const submit = async () => {
-    setErr(""); setInfo(""); setBusy(true);
-    try {
-      if (mode === "signin") { const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password: pass }); if (error) throw error; }
-      else {
-        if (!name.trim()) { setBusy(false); return setErr("Enter your name."); }
-        const { data, error } = await supabase.auth.signUp({ email: email.trim(), password: pass, options: { data: { full_name: name.trim() } } });
-        if (error) throw error;
-        if (!data.session) setInfo("Account created. If email confirmation is on, check your inbox, then sign in.");
-      }
-    } catch (e) { setErr(e.message || "Something went wrong."); }
-    setBusy(false);
+  const set = (k, v) => { setF((p) => ({ ...p, [k]: v })); setErr(""); };
+  const emailOk = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+  const friendly = (e) => {
+    const m = (e && e.message) || String(e || "");
+    if (/invalid login credentials/i.test(m)) return "Incorrect email or password.";
+    if (/email not confirmed/i.test(m)) return "Please confirm your email first (check your inbox), then sign in.";
+    if (/already registered/i.test(m)) return "Email already registered — sign in instead.";
+    if (/function .* does not exist|could not find the function/i.test(m)) return "Server isn't set up yet — run the latest supabase-schema.sql in Supabase.";
+    return m;
   };
+  const signin = async () => {
+    if (!emailOk(f.email.trim())) return setErr("Enter a valid email.");
+    const { error } = await supabase.auth.signInWithPassword({ email: f.email.trim(), password: f.pass });
+    if (error) return setErr(friendly(error));
+  };
+  const register = async () => {
+    if (!f.name.trim()) return setErr("Enter your full name.");
+    if (!emailOk(f.email.trim())) return setErr("Enter a valid email.");
+    if (f.pass.length < 6) return setErr("Password should be at least 6 characters.");
+    if (f.pass !== f.pass2) return setErr("Passwords don't match.");
+    const { data: ok, error: e1 } = await supabase.rpc("verify_access_code", { code: f.code.trim() });
+    if (e1) return setErr(friendly(e1));
+    if (ok !== true) return setErr("Invalid access code. Ask your team admin for the code.");
+    const { data, error } = await supabase.auth.signUp({ email: f.email.trim(), password: f.pass,
+      options: { data: { full_name: f.name.trim() }, emailRedirectTo: window.location.origin } });
+    if (error) return setErr(friendly(error));
+    if (data.session && data.user) {
+      const { error: e2 } = await supabase.rpc("join_team", { code: f.code.trim() });
+      if (e2) return setErr(friendly(e2));
+      onRegistered(data.user.id);
+    } else {
+      setInfo("Account created. Check your email to confirm it, then sign in here.");
+      setMode("signin"); setF((p) => ({ ...p, pass: "", pass2: "", code: "" }));
+    }
+  };
+  const submit = async () => { if (busy) return; setBusy(true); setInfo(""); try { await (mode === "signin" ? signin() : register()); } catch (e) { setErr(friendly(e)); } finally { setBusy(false); } };
+  const tabBtn = (m, l) => (
+    <button onClick={() => { setMode(m); setErr(""); }} style={{ flex: 1, padding: "9px 0", border: "none", borderRadius: 9, cursor: "pointer", fontSize: 13, fontWeight: 700,
+      background: mode === m ? "#fff" : "transparent", color: mode === m ? C.ink : C.muted, boxShadow: mode === m ? "0 1px 3px #0000001a" : "none" }}>{l}</button>
+  );
   return (
     <AuthShell title={mode === "signin" ? "Sign in" : "Create your account"}>
-      {mode === "signup" && <Field label="Your name"><TextInput value={name} onChange={setName} placeholder="e.g. Firly Rachmaditya Baskoro" /></Field>}
-      <Field label="Email"><TextInput value={email} onChange={setEmail} placeholder="you@team.com" /></Field>
-      <Field label="Password"><TextInput type="password" value={pass} onChange={setPass} placeholder="••••••••" onEnter={submit} /></Field>
-      {err && <div style={{ color: C.red, fontSize: 12.5 }}>{err}</div>}
+      <div style={{ display: "flex", gap: 4, background: C.bg, borderRadius: 11, padding: 4 }}>{tabBtn("signin", "Sign in")}{tabBtn("register", "Register")}</div>
+      {mode === "register" && <Field label="Full name"><TextInput value={f.name} onChange={(v) => set("name", v)} placeholder="As it should appear to the team" /></Field>}
+      <Field label="Email"><TextInput value={f.email} onChange={(v) => set("email", v)} placeholder="name@email.com" autoFocus onEnter={submit} /></Field>
+      <Field label="Password"><TextInput type="password" value={f.pass} onChange={(v) => set("pass", v)} onEnter={submit} /></Field>
+      {mode === "register" && <>
+        <Field label="Confirm password"><TextInput type="password" value={f.pass2} onChange={(v) => set("pass2", v)} onEnter={submit} /></Field>
+        <Field label="Access code"><TextInput type="password" value={f.code} onChange={(v) => set("code", v)} placeholder="Universal team code" onEnter={submit} /></Field>
+      </>}
       {info && <div style={{ color: C.green, fontSize: 12.5 }}>{info}</div>}
-      <PrimaryButton onClick={submit} full disabled={busy || !email || !pass}>{mode === "signin" ? <><LogIn size={15} /> Sign in</> : <><Mail size={15} /> Create account</>}</PrimaryButton>
-      <button onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setErr(""); setInfo(""); }} style={{ background: "none", border: "none", color: C.blue, cursor: "pointer", fontSize: 12.5 }}>
-        {mode === "signin" ? "Need an account? Create one" : "Already have an account? Sign in"}
-      </button>
+      {err && <div style={{ color: C.red, fontSize: 12.5 }}>{err}</div>}
+      <PrimaryButton onClick={submit} full disabled={busy}>{busy ? "Please wait…" : (mode === "signin" ? "Sign in" : "Register & enter")}</PrimaryButton>
+      <div style={{ fontSize: 11.5, color: C.muted, textAlign: "center" }}>
+        {mode === "signin" ? <>New here? <button onClick={() => { setMode("register"); setErr(""); }} style={{ ...linkBtn, fontSize: 11.5 }}>Register with the team access code</button></>
+          : <>Already registered? <button onClick={() => { setMode("signin"); setErr(""); }} style={{ ...linkBtn, fontSize: 11.5 }}>Sign in</button></>}
+      </div>
     </AuthShell>
+  );
+}
+
+function AccessCodeGate({ account, onPass, onSignOut }) {
+  const [code, setCode] = useState(""); const [err, setErr] = useState(""); const [busy, setBusy] = useState(false);
+  const go = async () => {
+    if (busy) return; setBusy(true); setErr("");
+    try {
+      const { data, error } = await supabase.rpc("join_team", { code: code.trim() });
+      if (error) setErr(/function .* does not exist|could not find the function/i.test(error.message) ? "Server isn't set up yet — run the latest supabase-schema.sql in Supabase." : error.message);
+      else if (data === true) onPass();
+      else setErr("Invalid access code.");
+    } finally { setBusy(false); }
+  };
+  return (
+    <AuthShell title="Enter access code">
+      <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, color: C.ink2 }}>
+        <Avatar name={account.name} members={[account.name]} size={32} />
+        <div style={{ minWidth: 0 }}><div style={{ fontWeight: 700 }}>{account.name}</div><div style={{ fontSize: 11.5, color: C.muted, overflow: "hidden", textOverflow: "ellipsis" }}>{account.email}</div></div>
+      </div>
+      <div style={{ fontSize: 12.5, color: C.muted }}>Enter the team access code to open the platform. It's required every time you sign in.</div>
+      <Field label="Access code"><TextInput type="password" value={code} onChange={(v) => { setCode(v); setErr(""); }} autoFocus onEnter={go} /></Field>
+      {err && <div style={{ color: C.red, fontSize: 12.5 }}>{err}</div>}
+      <PrimaryButton onClick={go} full disabled={busy}><Lock size={14} /> {busy ? "Checking…" : "Enter platform"}</PrimaryButton>
+      <div style={{ fontSize: 11.5, color: C.muted, textAlign: "center" }}>Not you? <button onClick={onSignOut} style={{ ...linkBtn, fontSize: 11.5 }}>Sign out</button></div>
+    </AuthShell>
+  );
+}
+
+function AdminPrompt({ onClose, onUnlocked, what = "this section" }) {
+  const admin = useAdmin();
+  const [code, setCode] = useState(""); const [err, setErr] = useState("");
+  const go = async () => { if (await admin.unlock(code)) { onUnlocked && onUnlocked(); onClose && onClose(); } else setErr("Incorrect admin password."); };
+  return (
+    <Modal onClose={onClose} title="Admin access required">
+      <div style={{ display: "grid", gap: 14 }}>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", fontSize: 13, color: C.ink2 }}>
+          <span style={{ width: 34, height: 34, borderRadius: 10, background: C.blueSoft, display: "grid", placeItems: "center", flexShrink: 0 }}><Lock size={16} color={C.blue} /></span>
+          Enter the admin password to open {what}. Access stays unlocked until you sign out.
+        </div>
+        <Field label="Admin password"><TextInput type="password" value={code} onChange={(v) => { setCode(v); setErr(""); }} autoFocus onEnter={go} /></Field>
+        {err && <div style={{ color: C.red, fontSize: 12.5 }}>{err}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end" }}><PrimaryButton onClick={go}><Lock size={14} /> Unlock</PrimaryButton></div>
+      </div>
+    </Modal>
+  );
+}
+
+function AdminGate({ title }) {
+  const admin = useAdmin();
+  const [code, setCode] = useState(""); const [err, setErr] = useState("");
+  const go = async () => { if (!(await admin.unlock(code))) setErr("Incorrect admin password."); };
+  return (
+    <div className="fade">
+      <Header title={title} />
+      <Card style={{ padding: 30, maxWidth: 440, margin: "30px auto", textAlign: "center" }}>
+        <span style={{ width: 48, height: 48, borderRadius: 14, background: C.blueSoft, display: "inline-grid", placeItems: "center", marginBottom: 12 }}><Lock size={22} color={C.blue} /></span>
+        <div className="disp" style={{ fontSize: 17 }}>{title} is admin-only</div>
+        <div style={{ fontSize: 12.5, color: C.muted, margin: "6px 0 18px" }}>Enter the admin password to continue. It stays unlocked until you sign out.</div>
+        <div style={{ display: "grid", gap: 10, textAlign: "left" }}>
+          <TextInput type="password" value={code} onChange={(v) => { setCode(v); setErr(""); }} placeholder="Admin password" autoFocus onEnter={go} />
+          {err && <div style={{ color: C.red, fontSize: 12.5 }}>{err}</div>}
+          <PrimaryButton onClick={go} full><Lock size={14} /> Unlock</PrimaryButton>
+        </div>
+      </Card>
+    </div>
   );
 }
 function AuthShell({ title, children }) {
@@ -447,7 +665,7 @@ function AuthShell({ title, children }) {
 }
 
 /* ------------------------------ Announcements ------------------------------ */
-function Announcements({ state, actions, currentUser }) {
+function Announcements({ state, update, currentUser }) {
   const members = state.members;
   const live = (state.announcements || []).filter((a) => !a.expiresAt || new Date(a.expiresAt).getTime() > Date.now());
   const [open, setOpen] = useState(false);
@@ -474,16 +692,19 @@ function Announcements({ state, actions, currentUser }) {
     const d = DURATIONS.find((x) => x.label === dur);
     const expiresAt = d && d.ms ? new Date(Date.now() + d.ms).toISOString() : null;
     const tags = members.filter((m) => text.includes("@" + m));
-    actions.postAnnouncement({ text: text.trim(), expiresAt, tags });
+    update((prev) => ({
+      announcements: [{ id: uid(), author: currentUser, text: text.trim(), createdAt: nowISO(), expiresAt, tags, editedAt: null, comments: [] }, ...prev.announcements],
+      notifications: [...tags.map((m) => mkNotif(m, "tagged", `${currentUser} tagged you in an announcement`)), ...prev.notifications],
+    }));
     setText(""); setOpen(false); setDur("1 week");
   };
-  const remove = (id) => actions.deleteAnnouncement(id);
+  const remove = (id) => update((prev) => ({ announcements: prev.announcements.filter((a) => a.id !== id) }));
   const editPost = (id, newText) => {
     const tags = members.filter((m) => newText.includes("@" + m));
-    const a = state.announcements.find((x) => x.id === id); if (a) actions.updateAnnouncement({ ...a, text: newText, tags, editedAt: nowISO() });
+    update((prev) => ({ announcements: prev.announcements.map((a) => a.id === id ? { ...a, text: newText, tags, editedAt: nowISO() } : a) }));
   };
-  const addComment = (id, body) => { const a = state.announcements.find((x) => x.id === id); if (a) actions.updateAnnouncement({ ...a, comments: [...(a.comments || []), { id: uid(), author: currentUser, text: body, createdAt: nowISO() }] }); };
-  const delComment = (id, cid) => { const a = state.announcements.find((x) => x.id === id); if (a) actions.updateAnnouncement({ ...a, comments: (a.comments || []).filter((c) => c.id !== cid) }); };
+  const addComment = (id, body) => update((prev) => ({ announcements: prev.announcements.map((a) => a.id === id ? { ...a, comments: [...(a.comments || []), { id: uid(), author: currentUser, text: body, createdAt: nowISO() }] } : a) }));
+  const delComment = (id, cid) => update((prev) => ({ announcements: prev.announcements.map((a) => a.id === id ? { ...a, comments: (a.comments || []).filter((c) => c.id !== cid) } : a) }));
 
   const shown = showAll ? live : live.slice(0, 3);
 
@@ -591,11 +812,11 @@ function AnnouncementPost({ a, members, currentUser, onDelete, onEdit, onComment
 
 /* ------------------------------ Personal ------------------------------ */
 const NOTIF_ICON = { assigned_project: UserPlus, tagged: AtSign, assigned_task: ListChecks, status_change: GanttChartSquare };
-function Personal({ state, actions, currentUser, setTab }) {
+function Personal({ state, update, currentUser, setTab }) {
   const mine = (state.notifications || []).filter((n) => sameUser(n.to, currentUser)).slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const [showAll, setShowAll] = useState(false);
   const shown = showAll ? mine : mine.slice(0, 3);
-  const dismiss = (id) => actions.dismissNotif(id);
+  const dismiss = (id) => update((prev) => ({ notifications: prev.notifications.filter((n) => n.id !== id) }));
   const myProjects = state.projects.filter((p) => !p.archived && assigneesOf(p).some((m) => sameUser(m, currentUser)));
   const [detail, setDetail] = useState(null);
 
@@ -644,7 +865,7 @@ function Personal({ state, actions, currentUser, setTab }) {
           ))}
         </div>
       )}
-      {detail && <ProjectDetail project={state.projects.find((p) => p.id === detail)} state={state} actions={actions} currentUser={currentUser} onClose={() => setDetail(null)} />}
+      {detail && <ProjectDetail project={state.projects.find((p) => p.id === detail)} state={state} update={update} currentUser={currentUser} onClose={() => setDetail(null)} />}
     </div>
   );
 }
@@ -771,15 +992,19 @@ function shiftPeriod(type, period, dir) {
 
 function ReportBar({ onGenerate }) {
   const btns = [["wtd", "Week-to-Date"], ["mtd", "Month-to-Date"], ["weekly", "Weekly"], ["monthly", "Monthly"]];
-  return (
+  const admin = useAdmin(); const [pending, setPending] = useState(null);
+  const pick = (k) => admin.unlocked ? onGenerate(k) : setPending(k);
+  return (<>
     <Card style={{ padding: 16, marginBottom: 20, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", borderLeft: `3px solid ${C.blue}` }}>
       <FileText size={18} color={C.blue} />
       <div><div className="disp" style={{ fontSize: 14 }}>Generate report</div><div style={{ fontSize: 11.5, color: C.muted }}>Download a PDF snapshot — opens your browser's print dialog, then choose "Save as PDF".</div></div>
       <div style={{ marginLeft: "auto", display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {btns.map(([k, l]) => <button key={k} onClick={() => onGenerate(k)} style={{ ...ghostBtnStyle, cursor: "pointer", display: "inline-flex", gap: 6, alignItems: "center" }}><Download size={13} /> {l}</button>)}
+        {!admin.unlocked && <span title="Admin password required" style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, color: C.muted }}><Lock size={12} /> Admin</span>}
+        {btns.map(([k, l]) => <button key={k} onClick={() => pick(k)} style={{ ...ghostBtnStyle, cursor: "pointer", display: "inline-flex", gap: 6, alignItems: "center" }}><Download size={13} /> {l}</button>)}
       </div>
     </Card>
-  );
+    {pending && <AdminPrompt what="reports" onClose={() => setPending(null)} onUnlocked={() => onGenerate(pending)} />}
+  </>);
 }
 
 function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
@@ -855,18 +1080,42 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
 
   const badge = `${meta.tag}: ${fmtRange(start, end)}`;
   const stampDate = saved ? saved.generatedAt.slice(0, 10) : todayISO();
-  const stamp = `${meta.stampLabel} ${prettyDate(stampDate)}`;
+  const netChange = monthIncome - monthExpense;
+  const pctOf = (v, tot) => tot ? Math.round((v / tot) * 100) : 0;
+  const statusLbl = (s) => s === "On Progress" ? "In Progress" : (s || "Not Started");
+  const statusDot = (s) => s === "Finished" ? C.green : (s === "On Progress" ? C.blue : C.amber);
+  const pipelineCols = STATUSES.map((st) => ({ st, items: active.filter((p) => p.status === st) }));
+  const byPriority = PRIORITIES.map((pr) => ({ name: pr, items: active.filter((p) => (p.priority || "Moderate") === pr) }));
+  const overviewRows = [["Total", active.length, C.blue], ["On Going", cnt("On Going"), C.blue], ["On Review", cnt("On Review"), C.amber], ["Finished", cnt("Finished"), C.green]];
+  const catStats = (cat) => {
+    const ps = active.filter((p) => p.category === cat);
+    const ti = ps.reduce((a, p) => a + totalOf(p), 0), di = ps.reduce((a, p) => a + doneOf(p), 0);
+    const open = ps.flatMap((p) => (p.checklist || []).filter((i) => !i.done).map((i) => ({ ...i, project: p })));
+    const ms = ps.flatMap((p) => (p.milestones || []).map((m) => ({ ...m, project: p }))).filter((m) => m.date >= asOf).sort((a, b) => a.date.localeCompare(b.date)).slice(0, 4);
+    return { ps, total: ps.length, ti, di, pc: ti ? Math.round(di / ti * 100) : 0, open, ns: open.filter((i) => i.status === "Not Started").length,
+      pr: PRIORITIES.map((x) => ({ name: x, n: ps.filter((p) => (p.priority || "Moderate") === x).length })), ms };
+  };
+  // integrated timeline (month columns)
+  const tproj2 = active.filter((p) => p.kickoff && p.wrapup);
+  let tMin = 0, tMax = 1, tMonths = [];
+  if (tproj2.length) {
+    const ts = tproj2.flatMap((p) => [new Date(p.kickoff + "T00:00:00").getTime(), new Date(p.wrapup + "T00:00:00").getTime()]);
+    const lo = new Date(Math.min(...ts)); lo.setDate(1); lo.setHours(0, 0, 0, 0);
+    const hiEnd = new Date(Math.max(...ts)); tMin = lo.getTime();
+    let d = new Date(lo); while (d <= hiEnd && tMonths.length < 7) { tMonths.push(new Date(d)); d.setMonth(d.getMonth() + 1); }
+    const last = new Date(tMonths[tMonths.length - 1]); last.setMonth(last.getMonth() + 1); tMax = last.getTime();
+  }
+  const tpos = (t) => tMax > tMin ? ((t - tMin) / (tMax - tMin)) * 100 : 0;
+  const CAT_ICON = { "Project": Calendar, "Research": Search, "Training": UsersRound };
 
   const PageHead = ({ suffix }) => (
-    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 16 }}>
+    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 14 }}>
       <div>
-        <h1 className="disp" style={{ margin: 0, fontSize: 24 }}>{meta.title}{suffix}</h1>
-        <div style={{ fontSize: 12, color: C.muted, marginTop: 3 }}>{stamp}</div>
+        <h1 className="disp" style={{ margin: 0, fontSize: 26, letterSpacing: -0.5 }}>{meta.title}{suffix}</h1>
+        <div style={{ fontSize: 12, color: C.muted, margin: "5px 0 9px" }}>Generated on {prettyDate(stampDate)}</div>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6, background: C.blue, color: "#fff", borderRadius: 9, padding: "6px 13px", fontSize: 12.5, fontWeight: 700 }}><Calendar size={13} /> {badge}</span>
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        <span style={{ background: C.blue, color: "#fff", borderRadius: 8, padding: "7px 14px", fontSize: 12.5, fontWeight: 700 }}>{badge}</span>
-        <img src={LOGO_SRC} alt="CoRE" style={{ height: 34 }} />
-      </div>
+      <img src={LOGO_SRC} alt="CoRE" style={{ height: 48 }} />
     </div>
   );
   const box = { background: "#fff", border: `1px solid ${C.line}`, borderRadius: 12, padding: 14 };
@@ -927,115 +1176,242 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
         </div>
 
         <div ref={printRef} className="report-print ui" style={{ background: C.bg }}>
-          {/* PAGE 1 — project snapshot */}
+          {/* PAGE 1 — operational */}
           <div className="report-page">
             <PageHead suffix="" />
-            <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1fr", gap: 10, marginBottom: 16 }}>
-              <div style={box}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Project overview</div>
-                <div style={{ display: "flex", gap: 14 }}>
-                  {[["Total", active.length, C.slate], ["On Going", cnt("On Going"), C.blue], ["Finished", cnt("Finished"), C.green], ["On Review", cnt("On Review"), C.amber]].map(([l, v, c]) => (
-                    <div key={l}><div className="disp" style={{ fontSize: 20 }}>{v}</div><div style={{ fontSize: 9, color: c, fontWeight: 700 }}>{l}</div></div>
-                  ))}
+            <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+              <div style={{ ...box, padding: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, textAlign: "center", marginBottom: 8 }}>Project Overview</div>
+                {overviewRows.map(([l, v, c]) => (
+                  <div key={l} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11, padding: "2px 0" }}>
+                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: c }} /><span style={{ color: C.ink2 }}>{l}</span>
+                    <span className="mono" style={{ marginLeft: "auto", fontWeight: 800 }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ ...box, padding: 12, textAlign: "center" }}>
+                <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 2 }}>Overall Progress</div>
+                <div style={{ display: "grid", placeItems: "center" }}><GaugeRing pct={pct} size={62} /></div>
+                <div style={{ fontSize: 10, color: C.muted, marginTop: 4 }}>{doneItems} / {totalItems} to-dos done</div>
+              </div>
+              <div style={{ ...box, padding: 12, textAlign: "center" }}>
+                <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Open To-Dos</div>
+                <div className="disp" style={{ fontSize: 34, lineHeight: 1 }}>{openTasks.length}</div>
+                <div style={{ fontSize: 10, color: C.muted, marginTop: 8 }}>{notStarted} not started</div>
+              </div>
+              <div style={{ ...box, padding: 12, textAlign: "center" }}>
+                <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Upcoming Milestones</div>
+                <div className="disp" style={{ fontSize: 34, lineHeight: 1 }}>{msSoon.length}</div>
+                <div style={{ fontSize: 10, color: C.muted, marginTop: 8 }}>{nextMs ? `Next: ${nextMs.date}` : "—"}</div>
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+              <div style={{ ...box, padding: 12 }}>
+                <SectionTitleR>Pipeline by Status</SectionTitleR>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6 }}>
+                  {pipelineCols.map(({ st, items }) => { const mt = STATUS_META[st]; return (
+                    <div key={st} style={{ border: `1px solid ${C.line}`, borderRadius: 8, overflow: "hidden" }}>
+                      <div style={{ textAlign: "center", padding: "6px 3px", background: mt.soft }}>
+                        <div style={{ fontSize: 9, fontWeight: 700, color: mt.color }}>{st}</div>
+                        <div className="disp" style={{ fontSize: 17 }}>{items.length}</div>
+                      </div>
+                      <div style={{ padding: 6, display: "grid", gap: 4, minHeight: 74 }}>
+                        {items.slice(0, 5).map((p) => <div key={p.id} style={{ fontSize: 8, color: C.ink2, lineHeight: 1.25 }}>• {p.name}</div>)}
+                      </div>
+                    </div>
+                  ); })}
                 </div>
               </div>
-              <div style={box}><div style={{ fontSize: 10, fontWeight: 700, color: C.muted, marginBottom: 6 }}>OVERALL PROGRESS</div><div className="disp" style={{ fontSize: 22 }}>{pct}%</div><div style={{ fontSize: 9.5, color: C.muted }}>{doneItems} / {totalItems} to-dos done</div></div>
-              <div style={box}><div style={{ fontSize: 10, fontWeight: 700, color: C.muted, marginBottom: 6 }}>OPEN TO-DOS</div><div className="disp" style={{ fontSize: 22 }}>{openTasks.length}</div><div style={{ fontSize: 9.5, color: C.muted }}>{notStarted} not started</div></div>
-              <div style={box}><div style={{ fontSize: 10, fontWeight: 700, color: C.muted, marginBottom: 6 }}>UPCOMING MILESTONES</div><div className="disp" style={{ fontSize: 22 }}>{msSoon.length}</div><div style={{ fontSize: 9.5, color: C.muted }}>{nextMs ? `Next: ${nextMs.date}` : "—"}</div></div>
+              <div style={{ ...box, padding: 12 }}>
+                <SectionTitleR>Priority Summary</SectionTitleR>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 6 }}>
+                  {byPriority.map(({ name, items }) => { const m = PRIORITY_META[name]; const hot = name === "Critical" || name === "Urgent"; const top = items[0]; return (
+                    <div key={name} style={{ border: `1px solid ${hot ? m.color : C.line}`, borderRadius: 8, padding: 7, background: hot ? m.soft : "#fff", minHeight: 108 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: m.color }} /><span style={{ fontSize: 9.5, fontWeight: 700, color: m.color }}>{name}</span></div>
+                      <div style={{ fontSize: 8.5, color: C.muted, marginBottom: 4 }}>{items.length} project{items.length !== 1 ? "s" : ""}</div>
+                      {hot ? (items.length ? (
+                        <div style={{ fontSize: 8, lineHeight: 1.35, display: "grid", gap: 2 }}>
+                          {items.slice(0, 6).map((p) => <div key={p.id} style={{ fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>• {p.name}</div>)}
+                          {items.length > 6 && <div style={{ color: C.muted }}>+{items.length - 6} more</div>}
+                        </div>
+                      ) : <div style={{ fontSize: 8, color: C.faint }}>None</div>) : null}
+                    </div>
+                  ); })}
+                </div>
+                <div style={{ fontSize: 8, color: C.muted, fontStyle: "italic", marginTop: 6 }}>Projects labeled Critical and Urgent notify all Members.</div>
+              </div>
             </div>
 
-            <SectionTitleR>Pipeline by status</SectionTitleR>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 16 }}>
-              {STATUSES.map((st) => { const items = active.filter((p) => p.status === st); const mt = STATUS_META[st];
-                return (
-                  <div key={st} style={{ ...box, padding: 10 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: mt.color }} /><span style={{ fontSize: 10.5, fontWeight: 700 }}>{st}</span><span style={{ marginLeft: "auto", fontSize: 10, color: C.muted }}>{items.length}</span></div>
-                    {items.slice(0, 4).map((p) => <div key={p.id} style={{ fontSize: 9.5, marginBottom: 5 }}><div style={{ fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.name}</div><div style={{ color: C.muted }}>{doneOf(p)}/{totalOf(p)} · {p.client || p.category}</div></div>)}
-                    {items.length === 0 && <div style={{ fontSize: 9.5, color: C.faint }}>—</div>}
+            <div style={{ ...box, padding: 12, marginBottom: 12 }}>
+              <SectionTitleR>Outstanding / Unresolved To-Dos</SectionTitleR>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead><tr>{["Task", "Project", "Assignee", "Due Date", "Status"].map((h) => <th key={h} style={th}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {openTasks.slice(0, 8).map((i) => (
+                    <tr key={i.id}>
+                      <td style={td}>{i.text}</td><td style={td}>{i.project.name}</td><td style={td}>{i.assignee === "All" ? "All" : i.assignee}</td><td style={td}>{i.dueDate || "—"}</td>
+                      <td style={td}><span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: statusDot(i.status) }} />{statusLbl(i.status)}</span></td>
+                    </tr>
+                  ))}
+                  {Array.from({ length: Math.max(0, 8 - openTasks.length) }).map((_, k) => (<tr key={"e" + k}><td style={td}><span style={{ width: 9, height: 9, border: `1px solid ${C.line}`, borderRadius: "50%", display: "inline-block" }} /></td><td style={td} /><td style={td} /><td style={td} /><td style={td} /></tr>))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ ...box, padding: 12, marginBottom: 12 }}>
+              <SectionTitleR>Integrated Project Timeline</SectionTitleR>
+              {tproj2.length === 0 ? <div style={{ fontSize: 10, color: C.muted }}>No dated projects.</div> : (
+                <div>
+                  <div style={{ display: "flex", borderBottom: `1px solid ${C.line}`, paddingBottom: 3, marginBottom: 4 }}>
+                    <div style={{ width: 150, flexShrink: 0, fontSize: 9, fontWeight: 700, color: C.muted }}>Project</div>
+                    <div style={{ position: "relative", flex: 1, height: 12 }}>
+                      {tMonths.map((m, i) => <span key={i} style={{ position: "absolute", left: `${tpos(m.getTime())}%`, fontSize: 8.5, fontWeight: 700, color: C.muted }}>{MONTHS[m.getMonth()].slice(0, 3)} {m.getFullYear()}</span>)}
+                    </div>
                   </div>
-                ); })}
+                  {tproj2.map((p) => { const s = new Date(p.kickoff + "T00:00:00").getTime(), e = new Date(p.wrapup + "T00:00:00").getTime(); const col = CATEGORY_COLOR[p.category] || C.blue; return (
+                    <div key={p.id} style={{ display: "flex", alignItems: "center", minHeight: 21 }}>
+                      <div style={{ width: 150, flexShrink: 0, fontSize: 8.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", paddingRight: 4 }}>{p.name}</div>
+                      <div style={{ position: "relative", flex: 1, height: 16 }}>
+                        <div style={{ position: "absolute", left: 0, right: 0, top: 7, height: 3, background: C.lineSoft, borderRadius: 2 }} />
+                        <div style={{ position: "absolute", left: `${tpos(s)}%`, width: `${Math.max(2, tpos(e) - tpos(s))}%`, top: 4, height: 9, background: col, borderRadius: 5 }} />
+                      </div>
+                    </div>
+                  ); })}
+                </div>
+              )}
             </div>
 
-            <SectionTitleR>Outstanding / unresolved to-dos <span style={{ color: C.muted }}>({openTasks.length})</span></SectionTitleR>
-            <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 16 }}>
-              <thead><tr>{["Task", "Project", "Assignee", "Due date", "Status"].map((h) => <th key={h} style={th}>{h}</th>)}</tr></thead>
-              <tbody>
-                {openTasks.slice(0, 12).map((i) => { const di = dueInfo(i, asOf); return (
-                  <tr key={i.id}>
-                    <td style={td}>{i.text}</td>
-                    <td style={{ ...td, color: C.blue }}>{i.project.name}</td>
-                    <td style={td}>{i.assignee === "All" ? "All" : i.assignee}</td>
-                    <td style={td}>{i.dueDate || "—"}{di && <div style={{ color: di.color, fontWeight: 700, fontSize: 9.5 }}>{di.label}</div>}</td>
-                    <td style={td}>{i.status}</td>
-                  </tr>
-                ); })}
-                {openTasks.length === 0 && <tr><td style={td} colSpan={5}>Nothing outstanding 🎉</td></tr>}
-              </tbody>
-            </table>
-
-            <SectionTitleR>Integrated project timeline</SectionTitleR>
-            <div style={{ ...box, marginBottom: 16 }}>{gantt || <div style={{ fontSize: 10, color: C.muted }}>No dated projects.</div>}</div>
-
-            <SectionTitleR>Upcoming events <span style={{ color: C.muted }}>(next 14 days)</span></SectionTitleR>
-            <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 14 }}>
-              <thead><tr>{["Date", "Event", "Project", "PIC"].map((h) => <th key={h} style={th}>{h}</th>)}</tr></thead>
-              <tbody>
-                {in14.slice(0, 8).map((e, i) => <tr key={i}><td style={td}>{e.date}</td><td style={td}>{e.kind}</td><td style={{ ...td, color: C.blue }}>{e.project.name}</td><td style={td}>{e.project.pic || "—"}</td></tr>)}
-                {in14.length > 8 && <tr><td style={{ ...td, color: C.muted }} colSpan={4}>+{in14.length - 8} more…</td></tr>}
-                {in14.length === 0 && <tr><td style={td} colSpan={4}>No events in the next 14 days.</td></tr>}
-              </tbody>
-            </table>
-
-            <div style={{ display: "flex", gap: 14, fontSize: 9, color: C.muted, flexWrap: "wrap", borderTop: `1px solid ${C.line}`, paddingTop: 8 }}>
-              {STATUSES.map((s) => <span key={s} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 7, height: 7, borderRadius: "50%", background: STATUS_META[s].color }} /> {s}</span>)}
-              <span style={{ flex: 1 }} />
+            <div style={{ ...box, padding: 12, marginBottom: 10 }}>
+              <SectionTitleR>Upcoming Events (Next 14 Days)</SectionTitleR>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead><tr>{["Date", "Event", "Project", "PIC"].map((h) => <th key={h} style={th}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {in14.slice(0, 5).map((e, i) => (<tr key={i}><td style={td}>{e.date}</td><td style={td}>{e.kind}</td><td style={td}>{e.project.name}</td><td style={td}>{e.project.pic || "—"}</td></tr>))}
+                  {Array.from({ length: Math.max(0, 3 - in14.length) }).map((_, k) => (<tr key={"e" + k}><td style={td}><span style={{ width: 9, height: 9, border: `1px solid ${C.line}`, borderRadius: "50%", display: "inline-block" }} /></td><td style={td} /><td style={td} /><td style={td} /></tr>))}
+                </tbody>
+              </table>
             </div>
-            <div style={{ fontSize: 8.5, color: C.faint, marginTop: 6 }}>{meta.note}</div>
+            <div style={{ fontSize: 8, color: C.faint }}>{meta.note}</div>
           </div>
 
-          {/* PAGE 2 — balance snapshot */}
+          {/* PAGE 2 — details by work category */}
           <div className="report-page">
-            <PageHead suffix=" — Balance" />
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 16 }}>
-              <SummaryCard icon={Wallet} tone={C.green} label="Current Balance" value={fmtRp(balance)} sub="All-time balance" />
-              <SummaryCard icon={ArrowUpRight} tone={C.blue} label="This Month’s Income" value={fmtRp(monthIncome)} />
-              <SummaryCard icon={ArrowDownRight} tone={C.red} label="This Month’s Expense" value={fmtRp(monthExpense)} />
-              <SummaryCard icon={TrendingUp} tone={C.green} label="Net Change" value={`${monthIncome - monthExpense >= 0 ? "+" : ""}${fmtRp(monthIncome - monthExpense)}`} />
+            <PageHead suffix="" />
+            <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 10 }}>Details by Work Category</div>
+            {CATEGORIES.map((cat) => { const s = catStats(cat); const col = CATEGORY_COLOR[cat]; const Icon = CAT_ICON[cat] || Calendar; return (
+              <div key={cat} style={{ ...box, padding: 12, marginBottom: 10 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "0.9fr 1fr 1fr 1fr 1.1fr", gap: 8, alignItems: "stretch", marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ width: 34, height: 34, borderRadius: 9, background: col + "1A", display: "grid", placeItems: "center" }}><Icon size={17} color={col} /></span>
+                    <div><div className="disp" style={{ fontSize: 16, color: col }}>{cat}</div><div style={{ fontSize: 9.5, color: C.muted }}>{s.total} work{s.total !== 1 ? "s" : ""}</div></div>
+                  </div>
+                  <div style={{ ...box, padding: 8, textAlign: "center" }}><div style={{ fontSize: 9, color: C.muted }}>Project Overview</div><div className="disp" style={{ fontSize: 22 }}>{s.total}</div><div style={{ fontSize: 8, color: C.muted }}>Total work{s.total !== 1 ? "s" : ""}</div></div>
+                  <div style={{ ...box, padding: 8, textAlign: "center" }}><div style={{ fontSize: 9, color: C.muted }}>Overall Progress</div><div style={{ display: "grid", placeItems: "center" }}><GaugeRing pct={s.pc} size={46} /></div><div style={{ fontSize: 7.5, color: C.muted }}>{s.di} / {s.ti} to-dos done</div></div>
+                  <div style={{ ...box, padding: 8, textAlign: "center" }}><div style={{ fontSize: 9, color: C.muted }}>Open To-Dos</div><div className="disp" style={{ fontSize: 22 }}>{s.open.length}</div><div style={{ fontSize: 8, color: C.muted }}>{s.ns} not started</div></div>
+                  <div style={{ ...box, padding: 8 }}><div style={{ fontSize: 9, color: C.muted, textAlign: "center", marginBottom: 3 }}>Priority Summary</div>
+                    {s.pr.map((x) => { const m = PRIORITY_META[x.name]; return <div key={x.name} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 9, padding: "1px 0" }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: m.color }} /><span>{x.name}</span><span className="mono" style={{ marginLeft: "auto", fontWeight: 700 }}>{x.n}</span></div>; })}
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1.8fr 1fr", gap: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 9.5, fontWeight: 700, marginBottom: 4 }}>Outstanding / Unresolved To-Dos</div>
+                    <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                      <thead><tr>{["Task", "Project", "Assignee", "Due Date", "Status"].map((h) => <th key={h} style={{ ...th, fontSize: 8, padding: "4px 5px" }}>{h}</th>)}</tr></thead>
+                      <tbody>
+                        {s.open.slice(0, 6).map((i) => (<tr key={i.id}><td style={{ ...td, fontSize: 8.5, padding: "4px 5px" }}>{i.text}</td><td style={{ ...td, fontSize: 8.5, padding: "4px 5px" }}>{i.project.name}</td><td style={{ ...td, fontSize: 8.5, padding: "4px 5px" }}>{i.assignee === "All" ? "All" : i.assignee}</td><td style={{ ...td, fontSize: 8.5, padding: "4px 5px" }}>{i.dueDate || "—"}</td><td style={{ ...td, fontSize: 8.5, padding: "4px 5px" }}><span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 5, height: 5, borderRadius: "50%", background: statusDot(i.status) }} />{statusLbl(i.status)}</span></td></tr>))}
+                        {Array.from({ length: Math.max(0, 3 - s.open.length) }).map((_, k) => (<tr key={"e" + k}><td style={{ ...td, fontSize: 8.5, padding: "4px 5px", color: C.faint }}>—</td><td style={{ ...td, padding: "4px 5px", color: C.faint }}>—</td><td style={{ ...td, padding: "4px 5px", color: C.faint }}>—</td><td style={{ ...td, padding: "4px 5px", color: C.faint }}>—</td><td style={{ ...td, padding: "4px 5px", color: C.faint }}>—</td></tr>))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 9.5, fontWeight: 700, marginBottom: 6 }}>Next Milestones</div>
+                    {s.ms.length === 0 ? <div style={{ fontSize: 9, color: C.faint }}>None upcoming.</div> : s.ms.map((m, i) => { const dot = [C.green, C.blue, C.amber, C.violet][i % 4]; return (
+                      <div key={i} style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                        <span style={{ width: 7, height: 7, borderRadius: "50%", background: dot, marginTop: 3, flexShrink: 0 }} />
+                        <div style={{ flex: 1 }}><div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, fontWeight: 700, gap: 6 }}><span>{m.name}</span><span style={{ color: C.muted, whiteSpace: "nowrap" }}>{m.date}</span></div><div style={{ fontSize: 8.5, color: C.blue }}>{m.project.name}</div></div>
+                      </div>
+                    ); })}
+                  </div>
+                </div>
+              </div>
+            ); })}
+            <div style={{ fontSize: 8, color: C.faint }}>{meta.note}</div>
+          </div>
+
+          {/* PAGE 3 — balance */}
+          <div className="report-page">
+            <PageHead suffix=" - Balance" />
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 12 }}>
+              {[
+                { t: "Current Balance", v: fmtRp(balance), sub: `As of ${end}`, icon: Wallet, tone: C.blue, val: C.ink },
+                { t: "This Month Income", v: fmtRp(monthIncome), sub: "Total income received", icon: ArrowUpRight, tone: C.green, val: C.green },
+                { t: "This Month Expense", v: fmtRp(monthExpense), sub: "Total expenses paid", icon: ArrowDownRight, tone: C.red, val: C.red },
+                { t: "Net Change", v: `${netChange >= 0 ? "+" : ""}${fmtRp(netChange)}`, sub: "Income minus expense", icon: TrendingUp, tone: C.green, val: C.green },
+              ].map((c, i) => (
+                <div key={i} style={{ ...box, padding: "12px 8px", textAlign: "center" }}>
+                  <div style={{ fontSize: 10, color: C.muted, marginBottom: 6 }}>{c.t}</div>
+                  <span style={{ width: 26, height: 26, borderRadius: "50%", background: c.tone + "1A", display: "inline-grid", placeItems: "center", marginBottom: 5 }}><c.icon size={14} color={c.tone} /></span>
+                  <div className="disp" style={{ fontSize: 13.5, color: c.val, whiteSpace: "nowrap" }}>{c.v}</div>
+                  <div style={{ fontSize: 8.5, color: C.muted, marginTop: 5 }}>{c.sub}</div>
+                </div>
+              ))}
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
-              <div style={box}><div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Income vs Expense · {MONTHS[bm]} {by}</div>
-                <div style={{ height: 170 }}><ResponsiveContainer>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+              <div style={{ ...box, padding: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 2 }}>Income vs Expense ({MONTHS[bm].slice(0, 3)} {by})</div>
+                <div style={{ display: "flex", gap: 14, justifyContent: "center", fontSize: 9, marginBottom: 2 }}><span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 8, height: 8, background: C.green, borderRadius: 2 }} />Income (Rp)</span><span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 8, height: 8, background: C.red, borderRadius: 2 }} />Expense (Rp)</span></div>
+                <div style={{ height: 148 }}><ResponsiveContainer>
                   <BarChart data={[{ name: "Income", value: monthIncome }, { name: "Expense", value: monthExpense }]} margin={{ top: 16, right: 8, left: 0, bottom: 0 }}>
                     <XAxis dataKey="name" tick={{ fontSize: 10, fill: C.muted }} axisLine={false} tickLine={false} />
-                    <YAxis tickFormatter={(v) => v >= 1e6 ? `${v / 1e6}M` : v} tick={{ fontSize: 9, fill: C.muted }} axisLine={false} tickLine={false} />
-                    <Bar dataKey="value" radius={[5, 5, 0, 0]}><Cell fill={C.blue} /><Cell fill={C.red} /></Bar>
+                    <YAxis tickFormatter={(v) => v >= 1e6 ? `${v / 1e6}M` : v} tick={{ fontSize: 8, fill: C.muted }} axisLine={false} tickLine={false} />
+                    <Bar dataKey="value" radius={[5, 5, 0, 0]} label={{ position: "top", formatter: (v) => fmtRp(v), fontSize: 9, fill: C.ink }}><Cell fill={C.green} /><Cell fill={C.red} /></Bar>
                   </BarChart>
                 </ResponsiveContainer></div>
               </div>
-              <div style={box}><div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Income by Category</div><DonutBlock data={incByCat} total={monthIncome} /></div>
+              <div style={{ ...box, padding: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Income by Category ({MONTHS[bm].slice(0, 3)} {by})</div>
+                <DonutBlock data={incByCat} total={monthIncome} />
+              </div>
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
-              <div style={box}><div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Expense by Purchase Category</div><DonutBlock data={expByPur} total={monthExpense} /></div>
-              <div style={box}><div style={{ fontSize: 11, fontWeight: 700, marginBottom: 8 }}>Expense by Work Category</div>
-                {monthExpense === 0 ? <div style={{ fontSize: 10, color: C.muted }}>No data</div> : expByWork.map((r) => { const p = monthExpense ? Math.round((r.value / monthExpense) * 100) : 0; return (
-                  <div key={r.name} style={{ marginBottom: 9 }}><div style={{ display: "flex", justifyContent: "space-between", fontSize: 10 }}><span>{r.name}</span><span style={{ color: C.muted }}>{fmtRp(r.value)} ({p}%)</span></div><div style={{ height: 8, background: C.lineSoft, borderRadius: 5 }}><div style={{ width: `${p}%`, height: "100%", background: r.fill, borderRadius: 5 }} /></div></div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+              <div style={{ ...box, padding: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 6 }}>Expense by Purchase Category ({MONTHS[bm].slice(0, 3)} {by})</div>
+                <DonutBlock data={expByPur} total={monthExpense} />
+              </div>
+              <div style={{ ...box, padding: 12 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 2 }}>Expense by Work Category ({MONTHS[bm].slice(0, 3)} {by})</div>
+                <div style={{ fontSize: 9, textAlign: "center", marginBottom: 6 }}><span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 8, height: 8, background: C.blue, borderRadius: 2 }} />Amount (Rp)</span></div>
+                {monthExpense === 0 ? <div style={{ fontSize: 10, color: C.muted }}>No data</div> : expByWork.map((r) => { const mx = Math.max(...expByWork.map((x) => x.value), 1); return (
+                  <div key={r.name} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                    <span style={{ width: 52, fontSize: 9, color: C.ink2 }}>{r.name}</span>
+                    <div style={{ flex: 1, height: 12, background: C.lineSoft, borderRadius: 3 }}><div style={{ width: `${(r.value / mx) * 100}%`, height: "100%", background: C.blue, borderRadius: 3 }} /></div>
+                    <span className="mono" style={{ fontSize: 8.5, color: C.ink2, whiteSpace: "nowrap" }}>{fmtRp(r.value)}</span>
+                  </div>
                 ); })}
               </div>
             </div>
-            <SectionTitleR>Recent transactions</SectionTitleR>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead><tr>{["Date", "Project", "Description", "Type", "Category", "Amount", "Account", "Method"].map((h) => <th key={h} style={th}>{h}</th>)}</tr></thead>
-              <tbody>
-                {recentTx.map((t) => <tr key={t.id}>
-                  <td style={td}>{t.date}</td><td style={{ ...td, color: C.blue }}>{projName(t.projectId)}</td><td style={td}>{t.description}</td>
-                  <td style={{ ...td, color: t.type === "Income" ? C.blue : C.red, fontWeight: 700 }}>{t.type}</td>
-                  <td style={td}>{t.category}</td><td style={td}>{fmtRp(t.amount)}</td>
-                  <td style={td}>{t.account === "Others" ? `Others: ${t.accountOther}` : t.account}</td><td style={td}>{t.method}</td>
-                </tr>)}
-                {recentTx.length === 0 && <tr><td style={td} colSpan={8}>No transactions this month.</td></tr>}
-              </tbody>
-            </table>
-            <div style={{ fontSize: 8.5, color: C.faint, marginTop: 10, borderTop: `1px solid ${C.line}`, paddingTop: 6 }}>Balance is evaluated at account level overall; category analytics reflect {MONTHS[bm]} {by}.</div>
+            <div style={{ ...box, padding: 12, marginBottom: 10 }}>
+              <SectionTitleR>Recent Transactions ({MONTHS[bm].slice(0, 3)} {by})</SectionTitleR>
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead><tr>{["Date", "Project", "Description", "Type", "Category", "Amount (Rp)", "Account", "Method", "Receipt"].map((h) => <th key={h} style={{ ...th, fontSize: 8, padding: "5px 5px" }}>{h}</th>)}</tr></thead>
+                <tbody>
+                  {recentTx.map((t) => (<tr key={t.id}>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px" }}>{t.date}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px" }}>{projName(t.projectId)}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px" }}>{t.description}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px", color: t.type === "Income" ? C.green : C.red, fontWeight: 700 }}>{t.type}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px" }}>{t.category}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px", color: t.type === "Income" ? C.green : C.red, fontWeight: 700 }}>{fmtRp(t.amount)}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px" }}>{t.account === "Others" ? t.accountOther : t.account}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px" }}>{t.method}</td>
+                    <td style={{ ...td, fontSize: 8.5, padding: "5px 5px" }}>{t.receipt ? <span style={{ color: C.blue }}>{t.receipt.name || "receipt"}</span> : "—"}</td>
+                  </tr>))}
+                  {recentTx.length === 0 && <tr><td style={td} colSpan={9}>No transactions.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ fontSize: 8, color: C.faint }}>Note: Balance is evaluated at the account level overall. Category analytics reflect transactions recorded in {MONTHS[bm]} {by}.</div>
           </div>
         </div>
       </div>
@@ -1043,48 +1419,95 @@ function ReportOverlay({ type, state, saved, onSave, currentUser, onClose }) {
   );
 }
 function SectionTitleR({ children }) { return <div style={{ fontSize: 11.5, fontWeight: 800, color: C.ink, margin: "4px 0 8px", textTransform: "uppercase", letterSpacing: 0.5 }}>{children}</div>; }
+function GaugeRing({ pct, size = 60 }) {
+  const r = 40, CC = 2 * Math.PI * r, arc = 0.75 * CC, prog = arc * (Math.max(0, Math.min(100, pct)) / 100);
+  return (
+    <svg width={size} height={size} viewBox="0 0 100 100">
+      <circle cx="50" cy="50" r={r} fill="none" stroke={C.lineSoft} strokeWidth="11" strokeLinecap="round" strokeDasharray={`${arc} ${CC}`} transform="rotate(135 50 50)" />
+      <circle cx="50" cy="50" r={r} fill="none" stroke={C.blue} strokeWidth="11" strokeLinecap="round" strokeDasharray={`${prog} ${CC}`} transform="rotate(135 50 50)" />
+      <text x="50" y="59" textAnchor="middle" style={{ fontSize: 25, fontWeight: 800, fill: C.ink }}>{pct}%</text>
+    </svg>
+  );
+}
 
 /* ------------------------------ Dashboard ------------------------------ */
-function Dashboard({ state, actions, currentUser, setTab }) {
-  const { projects, invoices, members } = state;
+function PriorityPanel({ byPriority, onOpen }) {
+  const isMobile = useIsMobile();
+  return (
+    <Card style={{ padding: 18, marginBottom: 22 }}>
+      <ChartTitle>Works by priority</ChartTitle>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "repeat(4,1fr)", gap: 12 }}>
+        {byPriority.map(({ name, items }) => {
+          const meta = PRIORITY_META[name]; const hot = name === "Critical" || name === "Urgent";
+          return (
+            <div key={name} style={{ border: `1px solid ${hot ? meta.color : C.line}`, borderRadius: 12, padding: 12, background: hot ? meta.soft : "#fff" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: meta.color }} />
+                <span style={{ fontSize: 12, fontWeight: 700, color: meta.color }}>{name}</span>
+                <span className="mono" style={{ marginLeft: "auto", fontSize: 15, fontWeight: 800 }}>{items.length}</span>
+              </div>
+              {hot ? (
+                items.length > 0 ? (
+                  <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
+                    {items.slice(0, 4).map((p) => (
+                      <button key={p.id} onClick={() => onOpen(p.id)} title={`${p.status}${p.subStatus ? " · " + p.subStatus : ""}`} style={{ ...linkBtn, fontSize: 11.5, color: C.ink, textAlign: "left", display: "block", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>• {p.name}</button>
+                    ))}
+                    {items.length > 4 && <span style={{ fontSize: 10.5, color: C.muted }}>+{items.length - 4} more</span>}
+                  </div>
+                ) : <div style={{ marginTop: 8, fontSize: 11, color: C.faint }}>None</div>
+              ) : <div style={{ marginTop: 6, fontSize: 10.5, color: C.muted }}>{items.length === 1 ? "project" : "projects"}</div>}
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function WorkAnalytics({ state, projects, update, currentUser, setTab, showCategory = true }) {
+  const { invoices, members } = state;
   const isMobile = useIsMobile();
   const [detail, setDetail] = useState(null);
   const [dragCol, setDragCol] = useState(null);
-  const [report, setReport] = useState(null);
-
   const active = projects.filter((p) => !p.archived);
-  const archivedCount = projects.length - active.length;
+  const archivedCount = projects.filter((p) => p.archived).length;
   const byCategory = CATEGORIES.map((c) => ({ name: c, value: active.filter((p) => p.category === c).length }));
   const byStatus = STATUSES.map((s) => ({ name: s, value: active.filter((p) => p.status === s).length }));
   const maxStatus = Math.max(1, ...byStatus.map((s) => s.value));
   const totalDone = active.reduce((a, p) => a + doneOf(p), 0);
   const totalItems = active.reduce((a, p) => a + totalOf(p), 0);
   const todoPct = totalItems ? Math.round((totalDone / totalItems) * 100) : 0;
+  const byPriority = PRIORITIES.map((pr) => ({ name: pr, items: active.filter((p) => (p.priority || "Moderate") === pr) }));
 
-  const moveStatus = (id, status) => actions.moveStatus(id, status);
+  const moveStatus = (id, status) => update((prev) => {
+    const p = prev.projects.find((x) => x.id === id); if (!p) return {};
+    const upd = withStatusMeta({ ...p, status, updatedAt: todayISO() });
+    const notifs = notifyTargets(upd, prev.members).map((m) => mkNotif(m, "status_change", `${currentUser} moved “${p.name}” to ${status}`, id));
+    return { projects: prev.projects.map((x) => x.id === id ? upd : x), notifications: [...notifs, ...prev.notifications] };
+  });
 
+  const cols = showCategory ? (isMobile ? "1fr" : "1.1fr 0.9fr 1fr") : (isMobile ? "1fr" : "0.9fr 1.2fr");
   return (
-    <div className="fade">
-      <Header title="Dashboard" />
-      <ReportBar onGenerate={setReport} />
-      <Announcements state={state} actions={actions} currentUser={currentUser} />
-      <div style={{ background: C.tint, borderRadius: 20, padding: isMobile ? 18 : 24, marginBottom: 20,
-        display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1.1fr 0.9fr 1fr", gap: isMobile ? 22 : 24, alignItems: "center" }}>
-        <div>
-          <PanelTitle>Works by category</PanelTitle>
-          {projects.length === 0 ? <NoData /> : (
-            <div style={{ height: 140 }}>
-              <ResponsiveContainer>
-                <BarChart data={byCategory} margin={{ top: 5, right: 6, left: -22, bottom: 0 }}>
-                  <XAxis dataKey="name" tick={{ fill: C.muted, fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <YAxis allowDecimals={false} tick={{ fill: C.muted, fontSize: 11 }} axisLine={false} tickLine={false} />
-                  <Tooltip cursor={{ fill: "#00000008" }} contentStyle={{ borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 12 }} />
-                  <Bar dataKey="value" radius={[6, 6, 0, 0]} barSize={42}>{byCategory.map((d) => <Cell key={d.name} fill={CATEGORY_COLOR[d.name]} />)}</Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </div>
+    <>
+      <div style={{ background: C.tint, borderRadius: 20, padding: isMobile ? 18 : 24, marginBottom: 16,
+        display: "grid", gridTemplateColumns: cols, gap: isMobile ? 22 : 24, alignItems: "center" }}>
+        {showCategory && (
+          <div>
+            <PanelTitle>Works by category</PanelTitle>
+            {active.length === 0 ? <NoData /> : (
+              <div style={{ height: 140 }}>
+                <ResponsiveContainer>
+                  <BarChart data={byCategory} margin={{ top: 5, right: 6, left: -22, bottom: 0 }}>
+                    <XAxis dataKey="name" tick={{ fill: C.muted, fontSize: 11 }} axisLine={false} tickLine={false} />
+                    <YAxis allowDecimals={false} tick={{ fill: C.muted, fontSize: 11 }} axisLine={false} tickLine={false} />
+                    <Tooltip cursor={{ fill: "#00000008" }} contentStyle={{ borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 12 }} />
+                    <Bar dataKey="value" radius={[6, 6, 0, 0]} barSize={42}>{byCategory.map((d) => <Cell key={d.name} fill={CATEGORY_COLOR[d.name]} />)}</Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </div>
+        )}
         <div style={{ display: "grid", placeItems: "center" }}>
           <Gauge value={todoPct} />
           <div style={{ fontSize: 12.5, color: C.ink2, marginTop: 2, fontWeight: 600 }}>Outputs completed</div>
@@ -1092,29 +1515,41 @@ function Dashboard({ state, actions, currentUser, setTab }) {
         </div>
         <div>
           <PanelTitle>Works by status</PanelTitle>
-          <div style={{ display: "grid", gap: 9 }}>
-            {byStatus.map((s) => (
-              <div key={s.name} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <span style={{ width: 74, fontSize: 12, color: C.ink2 }}>{s.name}</span>
-                <span style={{ flex: 1, height: 8, background: "#fff", borderRadius: 5, overflow: "hidden" }}>
-                  <span style={{ display: "block", width: `${(s.value / maxStatus) * 100}%`, height: "100%", background: STATUS_META[s.name].color, borderRadius: 5 }} />
-                </span>
-                <span className="mono" style={{ fontSize: 13, width: 20, textAlign: "right" }}>{s.value}</span>
-              </div>
-            ))}
+          <div style={{ display: "grid", gap: 10 }}>
+            {byStatus.map((s) => {
+              const subs = (SUB_STATUS[s.name] || []).map((ss) => ({ ss, n: active.filter((p) => p.status === s.name && p.subStatus === ss).length })).filter((x) => x.n > 0);
+              return (
+                <div key={s.name}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ width: 74, fontSize: 12, color: C.ink2 }}>{s.name}</span>
+                    <span style={{ flex: 1, height: 8, background: "#fff", borderRadius: 5, overflow: "hidden" }}>
+                      <span style={{ display: "block", width: `${(s.value / maxStatus) * 100}%`, height: "100%", background: STATUS_META[s.name].color, borderRadius: 5 }} />
+                    </span>
+                    <span className="mono" style={{ fontSize: 13, width: 20, textAlign: "right" }}>{s.value}</span>
+                  </div>
+                  {subs.length > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, margin: "5px 0 0 84px" }}>
+                      {subs.map((x) => <span key={x.ss} style={{ fontSize: 10, color: STATUS_META[s.name].color, background: STATUS_META[s.name].soft, borderRadius: 20, padding: "1px 8px" }}>{x.ss} · {x.n}</span>)}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
           <div style={{ display: "flex", gap: 10, marginTop: 16, paddingTop: 14, borderTop: `1px solid #ffffff` }}>
-            <button onClick={() => setTab("invoicing")} style={{ flex: 1, textAlign: "left", background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+            <button onClick={() => setTab && setTab("invoicing")} style={{ flex: 1, textAlign: "left", background: "none", border: "none", padding: 0, cursor: "pointer" }}>
               <div className="disp" style={{ fontSize: 27 }}>{invoices.length}</div>
               <div style={{ fontSize: 11.5, color: C.muted }}>Invoices generated</div>
             </button>
-            <button onClick={() => setTab("projects")} title="View archived in Projects" style={{ flex: 1, textAlign: "left", background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+            <div style={{ flex: 1, textAlign: "left" }}>
               <div className="disp" style={{ fontSize: 27 }}>{archivedCount}</div>
               <div style={{ fontSize: 11.5, color: C.muted, display: "inline-flex", alignItems: "center", gap: 4 }}><Archive size={11} /> Archived</div>
-            </button>
+            </div>
           </div>
         </div>
       </div>
+
+      <PriorityPanel byPriority={byPriority} onOpen={(id) => setDetail(id)} />
 
       <div style={{ marginBottom: 22 }}><EventCalendar projects={projects} onOpenProject={(id) => setDetail(id)} /></div>
 
@@ -1146,9 +1581,35 @@ function Dashboard({ state, actions, currentUser, setTab }) {
         })}
       </div>
 
-      {projects.length === 0 && <div style={{ marginTop: 20, textAlign: "center" }}><button onClick={() => setTab("projects")} style={linkBtn}>Add your first project <ChevronRight size={14} /></button></div>}
-      {detail && <ProjectDetail project={projects.find((p) => p.id === detail)} state={state} actions={actions} currentUser={currentUser} onClose={() => setDetail(null)} />}
-      {report && <ReportOverlay type={report} state={state} currentUser={currentUser} onSave={(r) => actions.saveReport(r)} onClose={() => setReport(null)} />}
+      {detail && <ProjectDetail project={projects.find((p) => p.id === detail)} state={state} update={update} currentUser={currentUser} onClose={() => setDetail(null)} />}
+    </>
+  );
+}
+
+function Dashboard({ state, update, currentUser, setTab }) {
+  const [report, setReport] = useState(null);
+  return (
+    <div className="fade">
+      <Header title="Dashboard" />
+      <ReportBar onGenerate={setReport} />
+      <Announcements state={state} update={update} currentUser={currentUser} />
+      <WorkAnalytics state={state} projects={state.projects} update={update} currentUser={currentUser} setTab={setTab} showCategory />
+      {state.projects.length === 0 && <div style={{ marginTop: 20, textAlign: "center" }}><button onClick={() => setTab("projects")} style={linkBtn}>Add your first project <ChevronRight size={14} /></button></div>}
+      {report && <ReportOverlay type={report} state={state} currentUser={currentUser} onSave={(r) => update((prev) => ({ reports: [r, ...(prev.reports || [])] }))} onClose={() => setReport(null)} />}
+    </div>
+  );
+}
+
+function CategorySubpage({ category, state, update, currentUser, setTab }) {
+  const projects = state.projects.filter((p) => p.category === category);
+  return (
+    <div className="fade">
+      <Header title={category} sub={`Analytics & projects for the ${category} work category`} />
+      <WorkAnalytics state={state} projects={projects} update={update} currentUser={currentUser} setTab={setTab} showCategory={false} />
+      <div style={{ marginTop: 26 }}>
+        <SectionLabel>{category} projects</SectionLabel>
+        <ProjectList state={state} update={update} currentUser={currentUser} category={category} />
+      </div>
     </div>
   );
 }
@@ -1164,6 +1625,10 @@ function KanbanCard({ p, members, onClick }) {
           {p.client && <div style={{ fontSize: 11.5, color: C.blue, marginTop: 2 }}>{p.client}</div>}
         </div>
         <span style={{ fontSize: 9.5, color: C.muted, border: `1px solid ${C.line}`, borderRadius: 5, padding: "1px 5px", whiteSpace: "nowrap" }}>{p.category}</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+        <PriorityChip priority={p.priority} small />
+        {p.subStatus && <span style={{ fontSize: 9.5, color: STATUS_META[p.status].color }}>{p.subStatus}</span>}
       </div>
       {totalOf(p) > 0 && (
         <div style={{ marginTop: 10 }}>
@@ -1198,36 +1663,79 @@ function Gauge({ value }) {
 }
 
 /* ------------------------------ Projects ------------------------------ */
-function Projects({ state, actions, currentUser }) {
+function ProjectList({ state, update, currentUser, category }) {
   const { projects, members } = state;
   const [q, setQ] = useState(""); const [fCat, setFCat] = useState("All"); const [fStat, setFStat] = useState("All");
   const [editing, setEditing] = useState(null); const [detail, setDetail] = useState(null);
   const filtered = projects.filter((p) => {
     if (p.archived) return false;
-    if (fCat !== "All" && p.category !== fCat) return false;
+    if (category && p.category !== category) return false;
+    if (!category && fCat !== "All" && p.category !== fCat) return false;
     if (fStat !== "All" && p.status !== fStat) return false;
     if (q && !(`${p.name} ${p.client} ${p.description} ${p.source} ${p.pic}`.toLowerCase().includes(q.toLowerCase()))) return false;
     return true;
   });
-  const save = async (proj) => { await actions.saveProject(proj); setEditing(null); };
-  const remove = (id) => actions.deleteProject(id);
-  const archive = (id) => actions.patchProject(id, { archived: true, archivedAt: todayISO() });
-  const unarchive = (id) => { const p = projects.find((x) => x.id === id); actions.patchProject(id, { archived: false, archivedAt: "", finishedAt: p && p.status === "Finished" ? todayISO() : (p ? p.finishedAt : "") }); };
+  const save = (proj) => {
+    update((prev) => {
+      const old = prev.projects.find((p) => p.id === proj.id);
+      const exists = !!old; const base = old || {};
+      const id = exists ? proj.id : uid();
+      const merged = withStatusMeta({ ...base, ...proj, id, createdAt: base.createdAt || todayISO(), updatedAt: todayISO() });
+      const before = exists ? assigneesOf(base) : [];
+      const recipients = notifyTargets(merged, prev.members);
+      const added = recipients.filter((m) => !before.includes(m));
+      const notifs = added.map((m) => mkNotif(m, "assigned_project",
+        isHotPriority(merged) ? `${currentUser} flagged “${merged.name}” as ${merged.priority}` : `${currentUser} added you to “${merged.name}” as ${m === merged.pic ? "PIC" : "collaborator"}`, id));
+      if (exists && base.status !== merged.status) recipients.forEach((m) => notifs.push(mkNotif(m, "status_change", `${currentUser} moved “${merged.name}” to ${merged.status}`, id)));
+      const projects = exists ? prev.projects.map((p) => p.id === id ? merged : p) : [merged, ...prev.projects];
+      return { projects, notifications: [...notifs, ...prev.notifications] };
+    });
+    setEditing(null);
+  };
+  const remove = (id) => update((prev) => ({ projects: prev.projects.filter((p) => p.id !== id) }));
+  const archive = (id) => update((prev) => ({ projects: prev.projects.map((p) => p.id === id ? { ...p, archived: true, archivedAt: todayISO() } : p) }));
+  const unarchive = (id) => update((prev) => ({ projects: prev.projects.map((p) => p.id === id ? { ...p, archived: false, archivedAt: "", finishedAt: p.status === "Finished" ? todayISO() : p.finishedAt } : p) }));
   return (
-    <div className="fade">
-      <Header title="Projects" sub={`${projects.length} works tracked`} action={<PrimaryButton onClick={() => setEditing({})}><Plus size={16} /> New project</PrimaryButton>} />
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+    <div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16, alignItems: "center" }}>
         <div style={{ position: "relative", flex: "1 1 240px", minWidth: 180 }}>
           <Search size={15} color={C.muted} style={{ position: "absolute", left: 12, top: 12 }} />
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search projects…" style={{ ...inputStyle, paddingLeft: 34 }} />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={`Search ${category || "projects"}…`} style={{ ...inputStyle, paddingLeft: 34 }} />
         </div>
-        <Select value={fCat} onChange={setFCat} options={["All", ...CATEGORIES]} compact />
+        {!category && <Select value={fCat} onChange={setFCat} options={["All", ...CATEGORIES]} compact />}
         <Select value={fStat} onChange={setFStat} options={["All", ...STATUSES]} compact />
+        <PrimaryButton onClick={() => setEditing({})}><Plus size={16} /> New project</PrimaryButton>
       </div>
-      {filtered.length === 0 ? <EmptyState label={projects.filter((p) => !p.archived).length === 0 ? "No active projects yet." : "No projects match your filters."} cta={projects.length === 0 ? { label: "New project", onClick: () => setEditing({}) } : null} />
+      {filtered.length === 0 ? <EmptyState label={projects.filter((p) => !p.archived && (!category || p.category === category)).length === 0 ? `No active ${category || "project"}s yet.` : "No projects match your filters."} cta={{ label: "New project", onClick: () => setEditing({}) }} />
         : <div style={{ display: "grid", gap: 10 }}>{filtered.map((p) => <ProjectRow key={p.id} p={p} members={members} onOpen={() => setDetail(p.id)} onEdit={() => setEditing(p)} onDelete={() => remove(p.id)} onArchive={() => archive(p.id)} onUnarchive={() => unarchive(p.id)} />)}</div>}
-      {editing && <ProjectModal project={editing} members={members} currentUser={currentUser} onSave={save} onClose={() => setEditing(null)} />}
-      {detail && <ProjectDetail project={projects.find((p) => p.id === detail)} state={state} actions={actions} currentUser={currentUser} onClose={() => setDetail(null)} onEdit={() => { const p = projects.find((x) => x.id === detail); setDetail(null); setEditing(p); }} />}
+      {editing && <ProjectModal project={editing} members={members} currentUser={currentUser} lockCategory={category} onSave={save} onClose={() => setEditing(null)} />}
+      {detail && <ProjectDetail project={projects.find((p) => p.id === detail)} state={state} update={update} currentUser={currentUser} onClose={() => setDetail(null)} onEdit={() => { const p = projects.find((x) => x.id === detail); setDetail(null); setEditing(p); }} />}
+    </div>
+  );
+}
+
+function Projects({ state, update, currentUser, setTab }) {
+  const { projects } = state;
+  const active = projects.filter((p) => !p.archived);
+  return (
+    <div className="fade">
+      <Header title="Projects" sub={`${active.length} active works tracked`} />
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 18 }}>
+        {CATEGORIES.map((c) => {
+          const n = active.filter((p) => p.category === c).length;
+          return (
+            <button key={c} onClick={() => setTab && setTab("cat:" + c)} style={{ flex: "1 1 150px", textAlign: "left", background: "#fff", border: `1px solid ${C.line}`, borderLeft: `3px solid ${CATEGORY_COLOR[c]}`, borderRadius: 14, padding: "13px 16px", cursor: "pointer" }}>
+              <div style={{ display: "flex", alignItems: "center" }}>
+                <span className="disp" style={{ fontSize: 22 }}>{n}</span>
+                <ChevronRight size={16} color={C.muted} style={{ marginLeft: "auto" }} />
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 700, marginTop: 2 }}>{c}</div>
+              <div style={{ fontSize: 11, color: C.muted }}>Open category page →</div>
+            </button>
+          );
+        })}
+      </div>
+      <ProjectList state={state} update={update} currentUser={currentUser} />
     </div>
   );
 }
@@ -1243,6 +1751,8 @@ function ProjectRow({ p, members, onOpen, onEdit, onDelete, onArchive, onUnarchi
             <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>{p.name}</h3>
             {p.client && <span style={{ fontSize: 12.5, color: C.blue, fontWeight: 600 }}>· {p.client}</span>}
             <StatusPill status={p.status} />
+            <SubStatusTag status={p.status} subStatus={p.subStatus} />
+            <PriorityChip priority={p.priority} />
             {p.archived && <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 700, color: C.muted, background: C.slateSoft, borderRadius: 20, padding: "3px 10px" }}><Archive size={12} /> Archived</span>}
             <span style={{ fontSize: 10.5, color: C.muted, border: `1px solid ${C.line}`, borderRadius: 5, padding: "1px 6px" }}>{p.category}</span>
           </div>
@@ -1269,15 +1779,17 @@ function ProjectRow({ p, members, onOpen, onEdit, onDelete, onArchive, onUnarchi
   );
 }
 
-function ProjectModal({ project, members, currentUser, onSave, onClose }) {
+function ProjectModal({ project, members, currentUser, onSave, onClose, lockCategory }) {
   const isMobile = useIsMobile();
   const [f, setF] = useState({
-    name: project.name || "", client: project.client || "", category: project.category || "Project",
-    status: project.status || "Prospect", source: project.source || "", pic: project.pic || "",
+    name: project.name || "", client: project.client || "", category: project.category || lockCategory || "Project",
+    status: project.status || "Prospect", subStatus: project.subStatus || "", priority: project.priority || "Moderate",
+    source: project.source || "", pic: project.pic || "",
     collaborators: project.collaborators || [], description: project.description || "", dataRoom: project.dataRoom || "",
     kickoff: project.kickoff || "", wrapup: project.wrapup || "", milestones: project.milestones || [], checklist: project.checklist || [],
     id: project.id, createdAt: project.createdAt,
   });
+  const setStatus = (v) => setF((p) => ({ ...p, status: v, subStatus: "" }));
   const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
   const toggleCollab = (m) => set("collaborators", f.collaborators.includes(m) ? f.collaborators.filter((x) => x !== m) : [...f.collaborators, m]);
   const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
@@ -1295,8 +1807,12 @@ function ProjectModal({ project, members, currentUser, onSave, onClose }) {
           <Field label="Client name"><TextInput value={f.client} onChange={(v) => set("client", v)} placeholder="e.g. Ditjen Minerba" /></Field>
         </div>
         <div style={two}>
-          <Field label="Category"><Select value={f.category} onChange={(v) => set("category", v)} options={CATEGORIES} /></Field>
-          <Field label="Status"><Select value={f.status} onChange={(v) => set("status", v)} options={STATUSES} /></Field>
+          <Field label="Category">{lockCategory ? <div style={{ ...inputStyle, background: C.bg, color: C.muted }}>{lockCategory}</div> : <Select value={f.category} onChange={(v) => set("category", v)} options={CATEGORIES} />}</Field>
+          <Field label="Priority"><Select value={f.priority} onChange={(v) => set("priority", v)} options={PRIORITIES} /></Field>
+        </div>
+        <div style={two}>
+          <Field label="Status"><Select value={f.status} onChange={setStatus} options={STATUSES} /></Field>
+          <Field label="Stage (sub-status)"><Select value={f.subStatus} onChange={(v) => set("subStatus", v)} options={SUB_STATUS[f.status] || []} placeholder="Select stage" /></Field>
         </div>
         <div style={two}>
           <Field label="Project source"><TextInput value={f.source} onChange={(v) => set("source", v)} placeholder="Anyone — client, referral, member…" /></Field>
@@ -1329,16 +1845,19 @@ function ProjectModal({ project, members, currentUser, onSave, onClose }) {
 }
 
 /* --------------------- Project detail: Gantt + checklist --------------------- */
-function ProjectDetail({ project, state, actions, currentUser, onClose, onEdit }) {
+function ProjectDetail({ project, state, update, currentUser, onClose, onEdit }) {
   const p = project; const members = state.members; if (!p) return null;
   const prog = progressOf(p);
-  const patchProject = (patch) => actions.patchProject(p.id, patch);
+  const patchProject = (patch) => update((prev) => ({ projects: prev.projects.map((x) => x.id === p.id ? { ...x, ...patch, updatedAt: todayISO() } : x) }));
   const [newTask, setNewTask] = useState(""); const [taskAssignee, setTaskAssignee] = useState("All"); const [taskDue, setTaskDue] = useState("");
   const assignOptions = ["All", ...assigneesOf(p)];
   const addTask = () => {
     if (!newTask.trim()) return;
     const item = { id: uid(), text: newTask.trim(), done: false, status: "Not Started", dueDate: taskDue, assignee: assignOptions.includes(taskAssignee) ? taskAssignee : "All" };
-    actions.addTask(p.id, item);
+    update((prev) => {
+      const notifs = (item.assignee !== "All") ? [mkNotif(item.assignee, "assigned_task", `${currentUser} assigned you a task in “${p.name}”`, p.id)] : [];
+      return { projects: prev.projects.map((x) => x.id === p.id ? { ...x, checklist: [...(x.checklist || []), item], updatedAt: todayISO() } : x), notifications: [...notifs, ...prev.notifications] };
+    });
     setNewTask(""); setTaskAssignee("All"); setTaskDue("");
   };
   const patchTask = (id, patch) => patchProject({ checklist: p.checklist.map((i) => i.id === id ? { ...i, ...patch, done: (patch.status ?? i.status) === "Finished" } : i) });
@@ -1352,7 +1871,7 @@ function ProjectDetail({ project, state, actions, currentUser, onClose, onEdit }
     <Modal onClose={onClose} title={null} xwide>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 4 }}>
         <div style={{ flex: 1 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}><h2 className="disp" style={{ margin: 0, fontSize: 20 }}>{p.name}</h2><StatusPill status={p.status} /></div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}><h2 className="disp" style={{ margin: 0, fontSize: 20 }}>{p.name}</h2><StatusPill status={p.status} /><SubStatusTag status={p.status} subStatus={p.subStatus} /><PriorityChip priority={p.priority} /></div>
           {p.client && <div style={{ fontSize: 13.5, color: C.blue, marginTop: 4, fontWeight: 600 }}>{p.client}</div>}
         </div>
         {onEdit && <GhostButton onClick={onEdit}><Pencil size={14} /> Edit</GhostButton>}
@@ -1498,7 +2017,7 @@ function ProjectGantt({ p }) {
 }
 
 /* ------------------------------ Timeline (integrated Gantt) ------------------------------ */
-function Timeline({ state, actions, currentUser }) {
+function Timeline({ state, update, currentUser }) {
   const projects = state.projects.filter((p) => p.kickoff && p.wrapup && !p.archived);
   const [detail, setDetail] = useState(null);
   if (projects.length === 0) return <div className="fade"><Header title="Timeline" /><EmptyState label="No projects have kick-off / wrap-up dates yet. Add dates on a project to see the integrated Gantt here." /></div>;
@@ -1561,23 +2080,24 @@ function Timeline({ state, actions, currentUser }) {
 
       <div style={{ marginTop: 22 }}><EventCalendar projects={state.projects} onOpenProject={(id) => setDetail(id)} /></div>
 
-      {detail && <ProjectDetail project={state.projects.find((p) => p.id === detail)} state={state} actions={actions} currentUser={currentUser} onClose={() => setDetail(null)} />}
+      {detail && <ProjectDetail project={state.projects.find((p) => p.id === detail)} state={state} update={update} currentUser={currentUser} onClose={() => setDetail(null)} />}
     </div>
   );
 }
 
 /* ------------------------------ Archive ------------------------------ */
-function ArchiveView({ state, actions, currentUser }) {
+function ArchiveView({ state, update, currentUser }) {
   const archived = state.projects.filter((p) => p.archived)
     .slice().sort((a, b) => (b.archivedAt || "").localeCompare(a.archivedAt || ""));
   const reports = (state.reports || []).slice().sort((a, b) => b.generatedAt.localeCompare(a.generatedAt));
   const [detail, setDetail] = useState(null);
   const [openReport, setOpenReport] = useState(null);
+  const [askReport, setAskReport] = useState(null); const admin = useAdmin();
   const [showAllReports, setShowAllReports] = useState(false);
   const shownReports = showAllReports ? reports : reports.slice(0, 3);
-  const unarchive = (id) => { const p = state.projects.find((x) => x.id === id); actions.patchProject(id, { archived: false, archivedAt: "", finishedAt: p && p.status === "Finished" ? todayISO() : (p ? p.finishedAt : "") }); };
-  const remove = (id) => actions.deleteProject(id);
-  const delReport = (id) => actions.deleteReport(id);
+  const unarchive = (id) => update((prev) => ({ projects: prev.projects.map((p) => p.id === id ? { ...p, archived: false, archivedAt: "", finishedAt: p.status === "Finished" ? todayISO() : p.finishedAt } : p) }));
+  const remove = (id) => update((prev) => ({ projects: prev.projects.filter((p) => p.id !== id) }));
+  const delReport = (id) => update((prev) => ({ reports: (prev.reports || []).filter((r) => r.id !== id) }));
   return (
     <div className="fade">
       <Header title="Archive" sub={`${archived.length} archived ${archived.length === 1 ? "project" : "projects"} · excluded from active progress & to-dos`} />
@@ -1597,7 +2117,7 @@ function ArchiveView({ state, actions, currentUser }) {
                   <div style={{ fontSize: 11, color: C.muted }}>Saved {r.generatedAt.slice(0, 10)}{r.generatedBy ? ` by ${r.generatedBy}` : ""}</div>
                 </div>
                 <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-                  <GhostButton onClick={() => setOpenReport(r)}><Eye size={14} /> Open</GhostButton>
+                  <GhostButton onClick={() => admin.unlocked ? setOpenReport(r) : setAskReport(r)}><Eye size={14} /> Open</GhostButton>
                   <IconBtn onClick={() => delReport(r.id)} danger small><Trash2 size={14} /></IconBtn>
                 </div>
               </Card>
@@ -1625,19 +2145,20 @@ function ArchiveView({ state, actions, currentUser }) {
         </div>
       )}
 
-      {detail && <ProjectDetail project={state.projects.find((p) => p.id === detail)} state={state} actions={actions} currentUser={currentUser} onClose={() => setDetail(null)} />}
+      {detail && <ProjectDetail project={state.projects.find((p) => p.id === detail)} state={state} update={update} currentUser={currentUser} onClose={() => setDetail(null)} />}
       {openReport && <ReportOverlay type={openReport.type} saved={openReport} state={state} currentUser={currentUser} onClose={() => setOpenReport(null)} />}
+      {askReport && <AdminPrompt what="this report" onClose={() => setAskReport(null)} onUnlocked={() => setOpenReport(askReport)} />}
     </div>
   );
 }
 
 /* ------------------------------ To Do ------------------------------ */
-function ToDo({ state, actions, currentUser }) {
+function ToDo({ state, update, currentUser }) {
   const projects = state.projects.filter((p) => !p.archived);
   const withItems = projects.filter((p) => totalOf(p) > 0);
   const totalDone = projects.reduce((a, p) => a + doneOf(p), 0);
   const totalItems = projects.reduce((a, p) => a + totalOf(p), 0);
-  const toggle = (pid, iid) => { const p = projects.find((x) => x.id === pid); if (!p) return; actions.patchProject(pid, { checklist: p.checklist.map((i) => i.id === iid ? { ...i, done: !i.done, status: i.done ? "Not Started" : "Finished" } : i) }); };
+  const toggle = (pid, iid) => update((prev) => ({ projects: prev.projects.map((p) => p.id === pid ? { ...p, checklist: p.checklist.map((i) => i.id === iid ? { ...i, done: !i.done, status: i.done ? "Not Started" : "Finished" } : i), updatedAt: todayISO() } : p) }));
 
   return (
     <div className="fade">
@@ -1766,7 +2287,7 @@ function groupSum(arr, keyFn) {
   return map;
 }
 
-function Balance({ state, actions, currentUser, setTab }) {
+function Balance({ state, update, currentUser, setTab }) {
   const isMobile = useIsMobile();
   const { transactions, projects, members, company } = state;
   const projName = (id) => (projects.find((p) => p.id === id) || {}).name || "—";
@@ -1809,49 +2330,31 @@ function Balance({ state, actions, currentUser, setTab }) {
     const tx = { id: uid(), date: f.date, projectId: f.projectId, description: f.description.trim(), type: f.type, category: f.category,
       workCategory: f.type === "Expense" ? f.workCategory : "", amount: Number(f.amount) || 0,
       account: f.account, accountOther: f.account === "Others" ? f.accountOther.trim() : "", method: f.method, receipt: f.receipt, createdBy: currentUser, createdAt: nowISO() };
-    actions.addTransaction(tx);
+    update((prev) => ({ transactions: [tx, ...prev.transactions] }));
     setF({ ...blank, date: f.date, account: f.account, accountOther: f.accountOther });
   };
-  const delTx = (id) => actions.deleteTransaction(id);
+  const delTx = (id) => update((prev) => ({ transactions: prev.transactions.filter((t) => t.id !== id) }));
 
   // excel export
   const [range, setRange] = useState({ start: `${now.getFullYear()}-01-01`, end: todayISO() });
-  const exportExcel = async () => {
+  const exportExcel = () => {
     const rows = transactions.filter((t) => (!range.start || t.date >= range.start) && (!range.end || t.date <= range.end)).sort((a, b) => a.date.localeCompare(b.date));
     const totInc = rows.filter((t) => t.type === "Income").reduce((a, t) => a + (Number(t.amount) || 0), 0);
     const totExp = rows.filter((t) => t.type === "Expense").reduce((a, t) => a + (Number(t.amount) || 0), 0);
-    const ExcelJS = (await import("exceljs")).default;
-    const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet("Financial Records");
-    ws.columns = [{ width: 12 }, { width: 22 }, { width: 28 }, { width: 9 }, { width: 18 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 22 }, { width: 10 }, { width: 16 }];
-    ws.addRow([company.name || APP_NAME]); ws.mergeCells(1, 1, 1, 11); ws.getCell("A1").font = { bold: true, size: 14 };
-    ws.addRow(["Financial Records"]); ws.mergeCells(2, 1, 2, 11); ws.getCell("A2").font = { bold: true };
-    ws.addRow(["Date of Record :", prettyDate(todayISO())]);
-    ws.addRow(["Starting Date :", range.start || "—"]);
-    ws.addRow(["End Date :", range.end || "—"]);
-    ws.addRow([]);
-    ws.addRow(["Total Income :", totInc]); ws.addRow(["Total Expense :", totExp]); ws.addRow(["Balance :", totInc - totExp]);
-    for (let r = 7; r <= 9; r++) ws.getCell(`A${r}`).font = { bold: true };
-    ws.addRow([]);
-    const headRow = ws.addRow(["Date", "Project", "Description", "Type", "Category", "Work Category", "Income (Rp)", "Expense (Rp)", "Account", "Method", "Receipt"]);
-    headRow.font = { bold: true }; headRow.alignment = { vertical: "middle" };
-    for (const t of rows) {
-      const r = ws.addRow([t.date, projName(t.projectId), t.description, t.type, t.category, t.type === "Expense" ? (t.workCategory || "") : "",
-        t.type === "Income" ? (Number(t.amount) || 0) : "", t.type === "Expense" ? (Number(t.amount) || 0) : "",
-        t.account === "Others" ? `Others: ${t.accountOther}` : t.account, t.method, ""]);
-      r.alignment = { vertical: "middle" };
-      if (t.receipt && t.receipt.dataUrl) {
-        r.height = 46;
-        const ext = t.receipt.dataUrl.startsWith("data:image/png") ? "png" : "jpeg";
-        const imgId = wb.addImage({ base64: t.receipt.dataUrl.split(",")[1], extension: ext });
-        ws.addImage(imgId, { tl: { col: 10.2, row: r.number - 1 + 0.12 }, ext: { width: 56, height: 38 }, editAs: "oneCell" });
-      }
-    }
-    const buf = await wb.xlsx.writeBuffer();
-    const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = `Financial_Records_${range.start || "all"}_to_${range.end || "all"}.xlsx`; a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    const head = [
+      [company.name || APP_NAME], ["Financial Records"],
+      ["Date of Record :", prettyDate(todayISO())], ["Starting Date :", range.start || "—"], ["End Date :", range.end || "—"], [],
+      ["Total Income :", totInc], ["Total Expense :", totExp], ["Balance :", totInc - totExp], [],
+      ["Date", "Project", "Description", "Type", "Category", "Work Category", "Income (Rp)", "Expense (Rp)", "Account", "Method", "Receipt"],
+    ];
+    const body = rows.map((t) => [t.date, projName(t.projectId), t.description, t.type, t.category, t.type === "Expense" ? (t.workCategory || "") : "",
+      t.type === "Income" ? (Number(t.amount) || 0) : "", t.type === "Expense" ? (Number(t.amount) || 0) : "",
+      t.account === "Others" ? `Others: ${t.accountOther}` : t.account, t.method, t.receipt ? t.receipt.name : ""]);
+    const ws = XLSX.utils.aoa_to_sheet([...head, ...body]);
+    ws["!cols"] = [{ wch: 12 }, { wch: 22 }, { wch: 28 }, { wch: 9 }, { wch: 18 }, { wch: 14 }, { wch: 16 }, { wch: 16 }, { wch: 22 }, { wch: 10 }, { wch: 20 }];
+    ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 10 } }, { s: { r: 1, c: 0 }, e: { r: 1, c: 10 } }];
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "Financial Records");
+    XLSX.writeFile(wb, `Financial_Records_${range.start || "all"}_to_${range.end || "all"}.xlsx`);
   };
 
   const download = (r) => { const a = document.createElement("a"); a.href = r.dataUrl; a.download = r.name || "receipt.jpg"; a.click(); };
@@ -2024,26 +2527,26 @@ function DonutBlock({ data, total }) {
   const nonzero = data.filter((d) => d.value > 0);
   if (!total) return <NoData />;
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-      <div style={{ position: "relative", width: 150, height: 150 }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+      <div style={{ position: "relative", width: 132, height: 132, flexShrink: 0 }}>
         <ResponsiveContainer>
           <PieChart>
-            <Pie data={nonzero} dataKey="value" nameKey="name" innerRadius={45} outerRadius={68} paddingAngle={2} stroke="none">
+            <Pie data={nonzero} dataKey="value" nameKey="name" innerRadius={40} outerRadius={62} paddingAngle={2} stroke="none">
               {nonzero.map((d, i) => <Cell key={i} fill={d.fill} />)}
             </Pie>
             <Tooltip formatter={(v) => fmtRp(v)} contentStyle={{ borderRadius: 10, border: `1px solid ${C.line}`, fontSize: 12 }} />
           </PieChart>
         </ResponsiveContainer>
         <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", pointerEvents: "none" }}>
-          <div style={{ textAlign: "center" }}><div style={{ fontSize: 9, color: C.muted }}>Rp</div><div className="disp" style={{ fontSize: 12 }}>{new Intl.NumberFormat("id-ID").format(total)}</div></div>
+          <div style={{ textAlign: "center" }}><div style={{ fontSize: 8.5, color: C.muted }}>Rp</div><div className="disp" style={{ fontSize: 11 }}>{new Intl.NumberFormat("id-ID").format(total)}</div></div>
         </div>
       </div>
-      <div style={{ flex: 1, minWidth: 140, display: "grid", gap: 6 }}>
-        {data.map((d, i) => { const pct = total ? Math.round((d.value / total) * 100) : 0; return (
-          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
-            <span style={{ width: 9, height: 9, borderRadius: "50%", background: d.fill, flexShrink: 0 }} />
-            <span style={{ flex: 1 }}>{d.name}</span>
-            <span style={{ color: C.muted }} className="mono">{pct}% · {fmtRp(d.value)}</span>
+      <div style={{ flex: 1, minWidth: 118, display: "grid", gap: 5 }}>
+        {data.map((d, i) => { const pct = total ? (d.value / total * 100) : 0; return (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 10.5 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: d.fill, flexShrink: 0 }} />
+            <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.name}</span>
+            <span style={{ color: C.muted, flexShrink: 0 }} className="mono">{pct.toFixed(1)}%</span>
           </div>
         ); })}
       </div>
@@ -2094,17 +2597,17 @@ function MiniStat({ label, value, tone }) {
   return <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 11, color: C.muted, marginBottom: 4 }}>{label}</div><div className="disp" style={{ fontSize: 14, color: tone }}>{value}</div></div>;
 }
 
-function Invoicing({ state, actions, currentUser }) {
+function Invoicing({ state, update, currentUser }) {
   const { projects, invoices, company } = state;
   const invoiceable = projects.filter((p) => p.status !== "Prospect" && !p.archived);
   const [target, setTarget] = useState(null);
   const nextNumber = () => `INV-${new Date().getFullYear()}-${String(invoices.length + 1).padStart(4, "0")}`;
   const generate = (project, number, date) => {
     buildInvoiceDoc({ company, project, number, dateStr: prettyDate(date) });
-    actions.addInvoice({ projectId: project.id, number, date, generatedBy: currentUser });
+    update((prev) => ({ invoices: [{ id: uid(), projectId: project.id, number, date, generatedBy: currentUser, createdAt: todayISO() }, ...prev.invoices] }));
     setTarget(null);
   };
-  const removeInvoice = (id) => actions.deleteInvoice(id);
+  const removeInvoice = (id) => update((prev) => ({ invoices: prev.invoices.filter((i) => i.id !== id) }));
   const regenerate = (inv) => { const p = projects.find((x) => x.id === inv.projectId); if (p) buildInvoiceDoc({ company, project: p, number: inv.number, dateStr: prettyDate(inv.date) }); };
   return (
     <div className="fade">
@@ -2169,29 +2672,55 @@ function InvoiceModal({ project, defaultNumber, company, onGenerate, onClose }) 
 }
 
 /* ------------------------------ Settings ------------------------------ */
-function SettingsView({ state, actions, session }) {
-  const isMobile = useIsMobile();
-  const [names, setNames] = useState(() => { const a = [...state.members]; while (a.length < 4) a.push(""); return a.slice(0, 4); });
+function SettingsView({ state, update, account }) {
+  const isMobile = useIsMobile(); const admin = useAdmin();
+  const [names, setNames] = useState(() => (state.members && state.members.length ? [...state.members] : [""]));
   const [comp, setComp] = useState({ ...state.company });
-  const [pw, setPw] = useState({ n1: "", n2: "" }); const [msg, setMsg] = useState("");
-  const flash = (m) => { setMsg(m); setTimeout(() => setMsg(""), 3000); };
-  const saveTeam = async () => { await actions.saveSettings({ members: names.map((n) => n.trim()).filter(Boolean), company: comp }); flash("Saved."); };
+  const [pw, setPw] = useState({ cur: "", n1: "", n2: "" }); const [msg, setMsg] = useState("");
+  const flash = (m) => { setMsg(m); setTimeout(() => setMsg(""), 2500); };
+  const saveTeam = () => { update({ members: Array.from(new Set(names.map((n) => n.trim()).filter(Boolean))), company: comp }); flash("Saved."); };
   const changePw = async () => {
-    if (pw.n1.length < 6) return flash("New password should be at least 6 characters.");
-    if (pw.n1 !== pw.n2) return flash("New passwords don't match.");
+    if (!account) return;
+    if (pw.n1.length < 6) return flash("New password should be at least 6 characters."); if (pw.n1 !== pw.n2) return flash("New passwords don't match.");
+    const { error: e1 } = await supabase.auth.signInWithPassword({ email: account.email, password: pw.cur });
+    if (e1) return flash("Current password is incorrect.");
     const { error } = await supabase.auth.updateUser({ password: pw.n1 });
     if (error) return flash(error.message);
-    setPw({ n1: "", n2: "" }); flash("Your password was updated.");
+    setPw({ cur: "", n1: "", n2: "" }); flash("Your password was updated.");
   };
+  const accounts = state.accounts || [];
   const two = { display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 12 };
   return (
     <div className="fade">
       <Header title="Settings" />
       {msg && <div style={{ background: C.blueSoft, border: `1px solid ${C.blue}`, color: C.blueDeep, padding: "10px 14px", borderRadius: 10, fontSize: 12.5, marginBottom: 16 }}>{msg}</div>}
       <Card style={{ padding: 22, marginBottom: 16 }}>
-        <ChartTitle><Users size={15} style={{ marginRight: 7, verticalAlign: -2 }} />Team member names</ChartTitle>
-        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>These names fill the PIC, collaborator and task-assignee pickers. To add or remove who can <b>log in</b>, manage accounts in Supabase &rarr; Authentication &rarr; Users.</div>
-        <div style={two}>{names.map((n, i) => <TextInput key={i} value={n} onChange={(v) => setNames((p) => p.map((x, j) => j === i ? v : x))} placeholder={`Member ${i + 1}`} />)}</div>
+        <ChartTitle><Users size={15} style={{ marginRight: 7, verticalAlign: -2 }} />Team members</ChartTitle>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>These names fill the PIC and collaborator pickers. New accounts are added automatically when someone registers.</div>
+        <div style={two}>{names.map((n, i) => (
+          <div key={i} style={{ display: "flex", gap: 6 }}>
+            <TextInput value={n} onChange={(v) => setNames((p) => p.map((x, j) => j === i ? v : x))} placeholder={`Member ${i + 1}`} />
+            <IconBtn onClick={() => setNames((p) => p.filter((_, j) => j !== i))} title="Remove" danger><Trash2 size={14} /></IconBtn>
+          </div>
+        ))}</div>
+        <div style={{ display: "flex", gap: 10, marginTop: 12, alignItems: "center" }}>
+          <GhostButton onClick={() => setNames((p) => [...p, ""])}><Plus size={14} /> Add member</GhostButton>
+          <PrimaryButton onClick={saveTeam}>Save members</PrimaryButton>
+        </div>
+      </Card>
+      <Card style={{ padding: 22, marginBottom: 16 }}>
+        <ChartTitle><UserCircle size={15} style={{ marginRight: 7, verticalAlign: -2 }} />Registered accounts <span style={{ color: C.muted, fontWeight: 600 }}>({accounts.length})</span></ChartTitle>
+        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>Anyone with an email, a personal password and the team access code can register.</div>
+        <div style={{ display: "grid", gap: 8 }}>
+          {accounts.map((a) => (
+            <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12.5, padding: "8px 10px", border: `1px solid ${C.lineSoft}`, borderRadius: 10 }}>
+              <Avatar name={a.name} members={state.members} size={26} />
+              <div style={{ minWidth: 0, flex: 1 }}><div style={{ fontWeight: 700 }}>{a.name}{account && a.id === account.id ? <span style={{ color: C.blue, fontWeight: 600 }}> · you</span> : null}</div><div style={{ color: C.muted, fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis" }}>{a.email}</div></div>
+              <span style={{ color: C.faint, fontSize: 11, whiteSpace: "nowrap" }}>{(a.createdAt || "").slice(0, 10)}</span>
+            </div>
+          ))}
+          {accounts.length === 0 && <div style={{ fontSize: 12, color: C.faint }}>No accounts yet.</div>}
+        </div>
       </Card>
       <Card style={{ padding: 22, marginBottom: 16 }}>
         <ChartTitle>Company details — used on invoices only</ChartTitle>
@@ -2209,13 +2738,18 @@ function SettingsView({ state, actions, session }) {
         <div style={{ marginTop: 16 }}><PrimaryButton onClick={saveTeam}>Save details</PrimaryButton></div>
       </Card>
       <Card style={{ padding: 22 }}>
-        <ChartTitle><Lock size={14} style={{ marginRight: 7, verticalAlign: -2 }} />Change my password</ChartTitle>
-        <div style={{ fontSize: 12, color: C.muted, marginBottom: 12 }}>Signed in as {session?.user?.email}. This changes your own account password.</div>
-        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 12, maxWidth: 420 }}>
-          <Field label="New password"><TextInput type="password" value={pw.n1} onChange={(v) => setPw({ ...pw, n1: v })} /></Field>
+        <ChartTitle><Lock size={14} style={{ marginRight: 7, verticalAlign: -2 }} />Change my password <span style={{ color: C.muted, fontWeight: 600 }}>{account ? `· ${account.email}` : ""}</span></ChartTitle>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 1fr", gap: 12 }}>
+          <Field label="Current"><TextInput type="password" value={pw.cur} onChange={(v) => setPw({ ...pw, cur: v })} /></Field>
+          <Field label="New"><TextInput type="password" value={pw.n1} onChange={(v) => setPw({ ...pw, n1: v })} /></Field>
           <Field label="Confirm new"><TextInput type="password" value={pw.n2} onChange={(v) => setPw({ ...pw, n2: v })} /></Field>
         </div>
         <div style={{ marginTop: 16 }}><GhostButton onClick={changePw}>Update password</GhostButton></div>
+      </Card>
+      <Card style={{ padding: 22, marginTop: 16, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <Lock size={16} color={admin.unlocked ? C.green : C.muted} />
+        <div style={{ flex: 1, minWidth: 200 }}><div style={{ fontSize: 13.5, fontWeight: 700 }}>Admin access</div><div style={{ fontSize: 12, color: C.muted }}>Reports, Balance and Invoicing need the admin password. {admin.unlocked ? "Currently unlocked for this session." : "Currently locked."}</div></div>
+        {admin.unlocked && <GhostButton onClick={admin.lock}>Lock again</GhostButton>}
       </Card>
     </div>
   );
@@ -2257,6 +2791,15 @@ function StatusPill({ status }) {
   const m = STATUS_META[status] || STATUS_META["Prospect"]; const Icon = m.icon;
   return <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 700, color: m.color, background: m.soft, borderRadius: 20, padding: "3px 10px" }}><Icon size={12} /> {status}</span>;
 }
+function SubStatusTag({ status, subStatus }) {
+  if (!subStatus) return null;
+  const m = STATUS_META[status] || STATUS_META["Prospect"];
+  return <span style={{ fontSize: 10.5, fontWeight: 600, color: m.color, border: `1px solid ${m.color}`, borderRadius: 20, padding: "2px 9px" }}>{subStatus}</span>;
+}
+function PriorityChip({ priority, small }) {
+  const m = PRIORITY_META[priority] || PRIORITY_META["Moderate"];
+  return <span title={`Priority: ${priority}`} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: small ? 9.5 : 11, fontWeight: 700, color: m.color, background: m.soft, borderRadius: 20, padding: small ? "1px 7px" : "2px 9px" }}><Flag size={small ? 9 : 11} /> {priority}</span>;
+}
 function EmptyState({ label, cta }) {
   return <Card style={{ padding: 44, textAlign: "center" }}><Sparkles size={22} color={C.faint} style={{ marginBottom: 12 }} /><div style={{ color: C.ink2, fontSize: 13.5 }}>{label}</div>{cta && <div style={{ marginTop: 16 }}><PrimaryButton onClick={cta.onClick}><Plus size={15} /> {cta.label}</PrimaryButton></div>}</Card>;
 }
@@ -2272,7 +2815,23 @@ function GhostButton({ children, onClick }) {
 }
 function Field({ label, children }) { return <label style={{ display: "block" }}><div style={{ fontSize: 12, color: C.ink2, marginBottom: 7, fontWeight: 600 }}>{label}</div>{children}</label>; }
 function TextInput({ value, onChange, placeholder, type = "text", autoFocus, onEnter }) {
-  return <input type={type} value={value} autoFocus={autoFocus} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && onEnter) onEnter(); }} style={inputStyle} />;
+  const [peek, setPeek] = useState(false);
+  const isPw = type === "password";
+  const input = <input type={isPw && peek ? "text" : type} value={value} autoFocus={autoFocus} placeholder={placeholder}
+    autoComplete={isPw ? "current-password" : undefined}
+    onChange={(e) => onChange(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && onEnter) onEnter(); }}
+    style={isPw ? { ...inputStyle, paddingRight: 40 } : inputStyle} />;
+  if (!isPw) return input;
+  return (
+    <div style={{ position: "relative", width: "100%" }}>
+      {input}
+      <button type="button" onClick={() => setPeek((p) => !p)} title={peek ? "Hide" : "Show"} aria-label={peek ? "Hide password" : "Show password"}
+        style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", width: 30, height: 30, border: "none", background: "transparent",
+          color: peek ? C.blue : C.muted, cursor: "pointer", display: "grid", placeItems: "center", borderRadius: 8 }}>
+        {peek ? <EyeOff size={16} /> : <Eye size={16} />}
+      </button>
+    </div>
+  );
 }
 function Select({ value, onChange, options, compact, placeholder }) {
   const opts = (options || []).map((o) => (o && typeof o === "object" ? o : { value: o, label: o }));

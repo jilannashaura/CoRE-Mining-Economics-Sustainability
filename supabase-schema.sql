@@ -1,6 +1,6 @@
 -- ============================================================
 --  Project Tracker — Supabase schema
---  Run this ONCE in Supabase → SQL Editor → New query → Run.
+--  Safe to re-run: paste the whole file into Supabase → SQL Editor → New query → Run.
 -- ============================================================
 
 create extension if not exists pgcrypto;
@@ -47,6 +47,8 @@ create table if not exists public.invoices (
 
 -- ---------- migrations (safe to re-run on an existing database) ----------
 alter table public.projects add column if not exists archived boolean default false;
+alter table public.projects add column if not exists sub_status text default '';
+alter table public.projects add column if not exists priority text default 'Moderate';
 alter table public.projects add column if not exists archived_at date;
 alter table public.projects add column if not exists finished_at date;
 
@@ -99,45 +101,88 @@ create table if not exists public.reports (
   snapshot jsonb default '{}'::jsonb
 );
 
+-- ---------- team access (access code + admin password, checked on the server) ----------
+-- Codes are stored bcrypt-hashed in a table no client can read.
+set search_path = public, extensions;
+
+create table if not exists public.team_members (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  email text,
+  name text,
+  joined_at timestamptz not null default now()
+);
+
+create table if not exists public.app_secrets (
+  key text primary key,
+  hash text not null
+);
+alter table public.app_secrets enable row level security;   -- no policies => invisible to the app
+revoke all on public.app_secrets from anon, authenticated;
+
+insert into public.app_secrets (key, hash) values
+  ('access', crypt('CoreMEM2026', gen_salt('bf'))),
+  ('admin',  crypt('AdminMEM2026', gen_salt('bf')))
+on conflict (key) do nothing;
+
+create or replace function public.is_member() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.team_members where user_id = auth.uid());
+$$;
+
+create or replace function public.verify_access_code(code text) returns boolean
+language sql stable security definer set search_path = public, extensions as $$
+  select exists (select 1 from public.app_secrets s where s.key = 'access' and s.hash = crypt(code, s.hash));
+$$;
+
+create or replace function public.join_team(code text) returns boolean
+language plpgsql security definer set search_path = public, extensions as $$
+declare u record;
+begin
+  if auth.uid() is null then return false; end if;
+  if not public.verify_access_code(code) then return false; end if;
+  select id, email, raw_user_meta_data into u from auth.users where id = auth.uid();
+  insert into public.team_members (user_id, email, name)
+  values (u.id, u.email, coalesce(nullif(u.raw_user_meta_data->>'full_name', ''), u.email))
+  on conflict (user_id) do update set email = excluded.email, name = excluded.name;
+  return true;
+end $$;
+
+create or replace function public.check_admin(code text) returns boolean
+language sql stable security definer set search_path = public, extensions as $$
+  select public.is_member()
+     and exists (select 1 from public.app_secrets s where s.key = 'admin' and s.hash = crypt(code, s.hash));
+$$;
+
+revoke all on function public.verify_access_code(text) from public;
+revoke all on function public.join_team(text) from public;
+revoke all on function public.check_admin(text) from public;
+grant execute on function public.verify_access_code(text) to anon, authenticated;
+grant execute on function public.join_team(text) to authenticated;
+grant execute on function public.check_admin(text) to authenticated;
+grant execute on function public.is_member() to authenticated;
+
 -- ---------- row level security ----------
--- Any signed-in team member can read & write the shared workspace.
--- (Data is NOT public — a valid login is required.)
-alter table public.settings enable row level security;
-alter table public.projects enable row level security;
-alter table public.invoices enable row level security;
-alter table public.announcements enable row level security;
-alter table public.notifications enable row level security;
-alter table public.transactions enable row level security;
-alter table public.reports enable row level security;
+-- Only signed-in users who have entered the access code (team_members) can read & write.
+do $$
+declare t text;
+begin
+  foreach t in array array['settings','projects','invoices','announcements','notifications','transactions','reports'] loop
+    execute format('alter table public.%I enable row level security', t);
+    execute format('drop policy if exists "authenticated all" on public.%I', t);
+    execute format('drop policy if exists "members all" on public.%I', t);
+    execute format('create policy "members all" on public.%I for all to authenticated using (public.is_member()) with check (public.is_member())', t);
+  end loop;
+end $$;
 
-drop policy if exists "authenticated all" on public.settings;
-drop policy if exists "authenticated all" on public.projects;
-drop policy if exists "authenticated all" on public.invoices;
-drop policy if exists "authenticated all" on public.announcements;
-drop policy if exists "authenticated all" on public.notifications;
-drop policy if exists "authenticated all" on public.transactions;
-drop policy if exists "authenticated all" on public.reports;
-
-create policy "authenticated all" on public.settings
-  for all to authenticated using (true) with check (true);
-create policy "authenticated all" on public.projects
-  for all to authenticated using (true) with check (true);
-create policy "authenticated all" on public.invoices
-  for all to authenticated using (true) with check (true);
-create policy "authenticated all" on public.announcements
-  for all to authenticated using (true) with check (true);
-create policy "authenticated all" on public.notifications
-  for all to authenticated using (true) with check (true);
-create policy "authenticated all" on public.transactions
-  for all to authenticated using (true) with check (true);
-create policy "authenticated all" on public.reports
-  for all to authenticated using (true) with check (true);
+alter table public.team_members enable row level security;
+drop policy if exists "members read" on public.team_members;
+create policy "members read" on public.team_members for select to authenticated using (public.is_member());
 
 -- ---------- realtime (live sync between teammates) ----------
 do $$
 declare t text;
 begin
-  foreach t in array array['settings','projects','invoices','announcements','notifications','transactions','reports'] loop
+  foreach t in array array['settings','projects','invoices','announcements','notifications','transactions','reports','team_members'] loop
     begin
       execute format('alter publication supabase_realtime add table public.%I', t);
     exception when duplicate_object then null;

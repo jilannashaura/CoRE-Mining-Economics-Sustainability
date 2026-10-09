@@ -8,7 +8,7 @@ const DEFAULT_COMPANY = {
 /* ---- projects ---- */
 const projToApp = (r) => ({
   id: r.id, name: r.name, client: r.client || "", category: r.category || "Project",
-  status: r.status || "Prospect", source: r.source || "", pic: r.pic || "",
+  status: r.status || "Prospect", subStatus: r.sub_status || "", priority: r.priority || "Moderate", source: r.source || "", pic: r.pic || "",
   collaborators: r.collaborators || [], description: r.description || "",
   dataRoom: r.data_room || "", kickoff: r.kickoff || "", wrapup: r.wrapup || "",
   milestones: r.milestones || [], checklist: r.checklist || [],
@@ -18,7 +18,7 @@ const projToApp = (r) => ({
 });
 const projToRow = (p) => ({
   id: p.id, name: p.name, client: p.client || "", category: p.category || "Project",
-  status: p.status || "Prospect", source: p.source || "", pic: p.pic || "",
+  status: p.status || "Prospect", sub_status: p.subStatus || "", priority: p.priority || "Moderate", source: p.source || "", pic: p.pic || "",
   collaborators: p.collaborators || [], description: p.description || "",
   data_room: p.dataRoom || "", kickoff: p.kickoff || null, wrapup: p.wrapup || null,
   milestones: p.milestones || [], checklist: p.checklist || [],
@@ -51,6 +51,12 @@ export async function listInvoices() {
 export async function insertInvoice(inv) {
   const row = { id: inv.id, project_id: inv.projectId, number: inv.number, date: inv.date, generated_by: inv.generatedBy || "" };
   const { data, error } = await supabase.from("invoices").insert(row).select().single();
+  if (error) throw error;
+  return invToApp(data);
+}
+export async function upsertInvoice(inv) {
+  const row = { id: inv.id, project_id: inv.projectId || null, number: inv.number, date: inv.date, generated_by: inv.generatedBy || "" };
+  const { data, error } = await supabase.from("invoices").upsert(row).select().single();
   if (error) throw error;
   return invToApp(data);
 }
@@ -131,6 +137,10 @@ export async function insertTransaction(t) {
   const { data, error } = await supabase.from("transactions").insert(txToRow(t)).select().single();
   if (error) throw error; return txToApp(data);
 }
+export async function upsertTransaction(t) {
+  const { data, error } = await supabase.from("transactions").upsert(txToRow(t)).select().single();
+  if (error) throw error; return txToApp(data);
+}
 export async function deleteTransaction(id) {
   const { error } = await supabase.from("transactions").delete().eq("id", id); if (error) throw error;
 }
@@ -144,7 +154,8 @@ export async function listReports() {
   if (error) throw error; return (data || []).map(repToApp);
 }
 export async function insertReport(r) {
-  const id = (typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + "-" + Math.random().toString(16).slice(2));
+  const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v || "");
+  const id = isUuid(r.id) ? r.id : ((typeof crypto !== "undefined" && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + "-" + Math.random().toString(16).slice(2)));
   const row = { id, type: r.type, start_date: r.start, end_date: r.end,
     generated_by: r.generatedBy || "", generated_at: r.generatedAt || new Date().toISOString(),
     snapshot: { projects: r.snapshotProjects || [], transactions: r.snapshotTx || [] } };
@@ -153,4 +164,11 @@ export async function insertReport(r) {
 }
 export async function deleteReport(id) {
   const { error } = await supabase.from("reports").delete().eq("id", id); if (error) throw error;
+}
+
+/* ---- team members (accounts that entered the access code) ---- */
+export async function listTeamMembers() {
+  const { data, error } = await supabase.from("team_members").select("*").order("joined_at", { ascending: true });
+  if (error) throw error;
+  return (data || []).map((r) => ({ id: r.user_id, name: r.name || r.email || "", email: r.email || "", createdAt: r.joined_at }));
 }

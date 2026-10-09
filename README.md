@@ -65,21 +65,34 @@ npm run dev               # opens http://localhost:5173
 
 ---
 
-## How the privacy / security works
+## Access: registration, access code, admin password
 
-- The site is public, but the **data is not** — every read and write requires a valid login (enforced by Supabase Row Level Security from the schema).
-- Any signed-in teammate can see and edit the whole shared workspace. That's the intended model for a small team.
-- To control who can log in, manage accounts in **Supabase → Authentication → Users**, and keep public sign-ups disabled.
-- Everyone shares one workspace; the "who am I" identity comes from the account you sign in with and is stamped on invoices you generate.
+- **Register:** full name + email + personal password + the team **access code**. Anyone with the code can join — no need to create accounts in Supabase by hand.
+- **Every sign-in:** after email + password, the app asks for the access code again before opening the platform (also after a page refresh).
+- **Admin password:** Reports, **Balance** and **Invoicing** ask for the admin password once per session (until sign-out).
+- Both codes are checked **on the server** (Supabase functions `verify_access_code`, `join_team`, `check_admin`) and stored bcrypt-hashed in `app_secrets`, a table the app can't read. They are not in the website code.
+- Database rows are only readable/writable by accounts that have entered the access code (`team_members`, enforced by Row Level Security).
+- Note: the admin password locks the Balance/Invoicing *screens*. A team member with technical skills could still read those tables through the API, because all members share one workspace.
+
+### Change a code later
+Run in Supabase → SQL Editor (replace the text in quotes):
+```sql
+update public.app_secrets set hash = extensions.crypt('NewAccessCode', extensions.gen_salt('bf')) where key = 'access';
+update public.app_secrets set hash = extensions.crypt('NewAdminPassword', extensions.gen_salt('bf')) where key = 'admin';
+```
+(If you get "schema extensions does not exist", drop the `extensions.` prefixes.)
+
+### Remove someone's access
+Supabase → Authentication → Users → delete the user. Their `team_members` row is removed with it.
 
 ## Costs
 
-Supabase and Netlify free tiers are comfortably enough for a 4-person tool. You may need to log into Supabase occasionally so the project isn't paused for inactivity (it emails you first).
+Supabase and Netlify free tiers are comfortably enough for a ~12-person tool. You may need to log into Supabase occasionally so the project isn't paused for inactivity (it emails you first).
 
 ## Troubleshooting
 
 - **Blank page / "Missing VITE_SUPABASE…" in the browser console:** the env variables aren't set, or you didn't redeploy after adding them. Re-check Step 4.3 and trigger a new deploy.
-- **Can sign in but no data loads / can't save:** make sure you ran the whole `supabase-schema.sql` (Step 1.3) and that the three policies were created.
+- **Can sign in but no data loads / can't save, or "Server isn't set up yet":** run the whole latest `supabase-schema.sql` again (it's safe to re-run).
 - **Changes don't sync live between people:** confirm the `alter publication supabase_realtime add table …` lines ran (they're in the schema). You can re-run just those lines safely.
 - **"Email not confirmed" on sign-in:** either confirm via the email link, or turn **Confirm email OFF** (Step 1.4) and recreate the user.
 
@@ -96,5 +109,5 @@ src/
   main.jsx            – entry point
   App.jsx             – the whole app (UI + logic)
   supabaseClient.js   – connects to your Supabase
-  db.js               – reads/writes projects, invoices, settings
+  db.js               – reads/writes every table
 ```
